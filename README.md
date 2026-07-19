@@ -1,98 +1,151 @@
-# Wallpaper Carousel
+# bgpicker-awww-swaybg
 
-Based on the original wallpaper picker by [ilyamiro](https://github.com/ilyamiro/nixos-configuration).
+A fullscreen skewed carousel wallpaper picker that simultaneously switches both
+**awww** (workspace wallpaper) and **swaybg** (background wallpaper) backends.
 
-A [DankMaterialShell](https://danklinux.com/) and [Noctalia](https://noctalia.dev/) plugin that lets you browse and pick wallpapers from a fullscreen skewed carousel overlay.
+Built on top of [wallpaperCarousel](https://github.com/motor-dev/wallpaperCarousel)'s
+`Carousel.qml` — runs as a standalone [Quickshell](https://quickshell.outfoxxed.me/)
+daemon, no DankMaterialShell or Noctalia required.
 
-![screenshot](screenshot.png)
+## Features
 
+- **100% visual fidelity** with wallpaperCarousel — parallelogram-skewed cards,
+  distance-based scale/opacity falloff, elastic bounce animations, fullscreen overlay
+- **Dual-backend switching** — awww (with fade transition) + swaybg (seamless, no
+  black flash) are switched simultaneously when you pick a wallpaper
+- **Keyboard navigation** — `←` / `→` to browse, `Enter` to apply, `Escape` to close
+- **Search** — `Ctrl+F` to filter wallpapers by filename
+- **Hold to preview** — dwell on a tile to expand it for a larger preview
+- **Three scroll modes** — infinite loop, wrap, or standard
 
-## About
+## Requirements
 
-Wallpaper Carousel scans your current wallpaper directory and displays all images in an animated 3D-skewed carousel. Navigate with keyboard or mouse, press Enter to apply. Thumbnails are pre-cached in memory at boot for instant opening.
+- [Quickshell](https://quickshell.outfoxxed.me/) ≥ 0.3.0
+- [awww](https://github.com/anyrun-org/awww) (workspace wallpaper daemon)
+- [swaybg](https://github.com/swaywm/swaybg) (background wallpaper)
+- A Wayland compositor with wlr-layer-shell support (e.g. Niri, Hyprland, Sway)
 
-This plugin integrates with all shell features — selecting a wallpaper updates the shell wallpaper, color scheme, and wallpaper animations configured in the shell.
+## Setup
 
-https://github.com/user-attachments/assets/39bcde76-7d7b-40c0-a083-3b8961edf10b
+### 1. Wallpaper directories
 
-## Credits
+Place your wallpapers in both directories with **matching filenames**:
 
-Original wallpaper picker by [ilyamiro](https://github.com/ilyamiro/nixos-configuration).
+```
+~/swaybg_wallpapers/
+├── A.png
+├── B.png
+└── C.png
 
-Wallpaper collection in the screenshot/video from [Andreas Rocha](https://www.andreasrocha.com/).
+~/awww_wallpapers/
+├── A.png    ← same filename, can be a different image
+├── B.png
+└── C.png
+```
 
+When you select `A.png` in the carousel, `swaybg` gets `~/swaybg_wallpapers/A.png`
+and `awww` gets `~/awww_wallpapers/A.png`.
 
-## Install
+### 2. Start the daemon
 
-> **Note:** Your shell (Noctalia or DankMaterialShell) must be managing your wallpaper for this plugin to work. It does not work with external wallpaper engines (e.g. swww, swaybg, hyprpaper). Enable wallpaper management in DMS Settings → Wallpaper or Noctalia Settings → Wallpaper.
+```bash
+# Start the bgpicker daemon (stays in foreground)
+qs -p /home/minec/playground/bgpicker-awww-swaybg
 
-### Plugin manager
+# Or use the convenience script (auto-daemonizes)
+./bgpicker.sh start
+```
 
-The plugin can be installed from the plugin browser in Noctalia and DankMaterialShell.
+Or add to your compositor startup (e.g. in `~/.config/niri/config.kdl`):
 
-### Manual install
+```kdl
+spawn-at-startup "qs" "-p" "/home/minec/playground/bgpicker-awww-swaybg" "-n" "-d"
+```
 
-1. Download the latest archive from the [Releases](../../releases) page
-2. a. Extract it into your DMS plugins directory:
-      ```sh
-      tar xf wallpaperCarousel-*.tar.gz -C "${XDG_CONFIG_HOME:-$HOME/.config}/DankMaterialShell/plugins/"
-      ```
-   b. _OR_ Extract it into your Noctalia plugins directory:
-      ```sh
-      tar xf wallpaperCarousel-*.tar.gz -C "${XDG_CONFIG_HOME:-$HOME/.config}/noctalia/plugins/"
-      ```
-3. a. Open DankMaterialShell Settings → Plugins and enable **Wallpaper Carousel**
-   b. _OR_ Open Noctalia Settings → Plugins and enable **Wallpaper Carousel**
-4. Bind keys in your compositor config (see below) or call the IPC commands from a script
+### 3. Bind keys
 
-## IPC Commands
-
-### DMS
-
-Control the carousel via DMS IPC:
-
-| Command | Description |
-|---------|-------------|
-| `dms ipc wallpaperCarousel toggle` | Open or close the overlay |
-| `dms ipc wallpaperCarousel open` | Open the overlay |
-| `dms ipc wallpaperCarousel close` | Close the overlay |
-| `dms ipc wallpaperCarousel cycleNext` | Open (if closed) and highlight next wallpaper |
-| `dms ipc wallpaperCarousel cyclePrevious` | Open (if closed) and highlight previous wallpaper |
-
-### Noctalia
-
-Control the carousel via Noctalia IPC:
-
-| Command | Description |
-|---------|-------------|
-| `qs -c noctalia-shell ipc call wallpaperCarousel toggle` | Open or close the overlay |
-| `qs -c noctalia-shell ipc call wallpaperCarousel open` | Open the overlay |
-| `qs -c noctalia-shell ipc call wallpaperCarousel close` | Close the overlay |
-| `qs -c noctalia-shell ipc call wallpaperCarousel cycleNext` | Open (if closed) and highlight next wallpaper |
-| `qs -c noctalia-shell ipc call wallpaperCarousel cyclePrevious` | Open (if closed) and highlight previous wallpaper |
-
-**Keyboard shortcuts** (when open): `←` / `→` to navigate, `Enter` to apply, `Escape` to close.
-
-## Example Compositor Keybindings
-
-### Niri
-
-In `~/.config/niri/config.kdl`:
+#### Niri (`~/.config/niri/config.kdl`)
 
 ```kdl
 binds {
-    Mod+W { spawn "dms" "ipc" "wallpaperCarousel" "toggle"; }
-    Mod+Shift+Right { spawn "dms" "ipc" "wallpaperCarousel" "cycleNext"; }
-    Mod+Shift+Left { spawn "dms" "ipc" "wallpaperCarousel" "cyclePrevious"; }
+    // Toggle the wallpaper carousel
+    Mod+W { spawn "qs" "ipc" "-p" "/home/minec/playground/bgpicker-awww-swaybg" "call" "wallpaperCarousel" "toggle"; }
+
+    // Or use the convenience script
+    // Mod+W { spawn "/home/minec/playground/bgpicker-awww-swaybg/bgpicker.sh" "toggle"; }
+
+    // Cycle through wallpapers
+    Mod+Shift+Right { spawn "qs" "ipc" "-p" "/home/minec/playground/bgpicker-awww-swaybg" "call" "wallpaperCarousel" "cycleNext"; }
+    Mod+Shift+Left  { spawn "qs" "ipc" "-p" "/home/minec/playground/bgpicker-awww-swaybg" "call" "wallpaperCarousel" "cyclePrevious"; }
 }
 ```
 
-### Hyprland
-
-In `~/.config/hypr/hyprland.conf`:
+#### Hyprland (`~/.config/hypr/hyprland.conf`)
 
 ```ini
-bind = SUPER, W, exec, dms ipc wallpaperCarousel toggle
-bind = SUPER SHIFT, Right, exec, dms ipc wallpaperCarousel cycleNext
-bind = SUPER SHIFT, Left, exec, dms ipc wallpaperCarousel cyclePrevious
+bind = SUPER, W, exec, qs ipc -p /home/minec/playground/bgpicker-awww-swaybg call wallpaperCarousel toggle
+bind = SUPER SHIFT, Right, exec, qs ipc -p /home/minec/playground/bgpicker-awww-swaybg call wallpaperCarousel cycleNext
+bind = SUPER SHIFT, Left, exec, qs ipc -p /home/minec/playground/bgpicker-awww-swaybg call wallpaperCarousel cyclePrevious
 ```
+
+## IPC Commands
+
+| Command | Description |
+|---------|-------------|
+| `qs ipc -p <path> call wallpaperCarousel toggle` | Toggle the overlay |
+| `qs ipc -p <path> call wallpaperCarousel open` | Open the overlay |
+| `qs ipc -p <path> call wallpaperCarousel close` | Close the overlay |
+| `qs ipc -p <path> call wallpaperCarousel cycleNext` | Open + highlight next |
+| `qs ipc -p <path> call wallpaperCarousel cyclePrevious` | Open + highlight previous |
+
+Where `<path>` is `/home/minec/playground/bgpicker-awww-swaybg`.
+
+## Keyboard shortcuts (when overlay is open)
+
+| Key | Action |
+|-----|--------|
+| `←` / `H` | Previous wallpaper |
+| `→` / `L` | Next wallpaper |
+| `Enter` | Apply selected wallpaper |
+| `Escape` | Close overlay |
+| `Ctrl+F` | Open search bar |
+| `Home` | Jump to first |
+| `End` | Jump to last |
+
+## Configuration
+
+Edit the `cfg` object in `BgPicker.qml` to customize the carousel appearance:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `carouselMode` | `"wrap"` | `"standard"`, `"wrap"`, or `"infinite"` |
+| `overlayOpacity` | `80` | Background dimming (0–100) |
+| `cornerRadius` | `12` | Card corner rounding in pixels |
+| `itemWidth` | `300` | Card width in pixels |
+| `itemHeight` | `420` | Card height in pixels |
+| `borderWidth` | `3` | Card border width |
+| `selectedScale` | `108` | Center card scale (percentage) |
+| `expandSelected` | `"false"` | Widen the center card |
+| `enableHoldExpand` | `"true"` | Hold-to-preview mode |
+| `holdDelay` | `1500` | Hold delay in ms before expanding |
+
+To change wallpaper directories, edit the `dirSwaybg` and `dirAwww` properties
+at the top of `BgPicker.qml`.
+
+## File Structure
+
+```
+bgpicker-awww-swaybg/
+├── shell.qml              # Quickshell entry point
+├── BgPicker.qml           # Wrapper: connects Carousel to awww/swaybg
+├── Carousel.qml           # Core carousel UI (from wallpaperCarousel, unmodified)
+├── switch_wallpaper.sh    # Helper: performs the actual awww + swaybg switch
+├── bgpicker.sh            # Convenience script: daemon lifecycle + IPC
+├── manifest.conf          # Quickshell config metadata
+└── README.md              # This file
+```
+
+## Credits
+
+- Carousel UI: [wallpaperCarousel](https://github.com/motor-dev/wallpaperCarousel) by yngwe
+- Original wallpaper picker concept: [ilyamiro](https://github.com/ilyamiro/nixos-configuration)
