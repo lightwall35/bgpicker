@@ -482,12 +482,10 @@ Item {
                                 maskThresholdMin: 0.5
                             }
 
-                            Image {
+                            Rectangle {
                                 anchors.fill: parent
-                                source: delegateRoot.fileUrl
-                                sourceSize: (carousel.heldIndex === delegateRoot.index) ? Qt.size(width, height) : Qt.size(carousel.itemWidth, carousel.itemHeight)
-                                fillMode: Image.Stretch
-                                asynchronous: true
+                                radius: carousel.cornerRadius
+                                color: "#33FFFFFF"
                                 visible: innerImage.status === Image.Ready
                             }
 
@@ -507,8 +505,33 @@ Item {
                                     height: parent.height
                                     fillMode: Image.PreserveAspectCrop
                                     source: delegateRoot.fileUrl
-                                    sourceSize: (carousel.heldIndex === delegateRoot.index) ? Qt.size(width, height) : Qt.size(carousel.itemWidth, carousel.itemHeight)
+                                    sourceSize: Qt.size(carousel.itemWidth, carousel.itemHeight)
                                     asynchronous: true
+
+                                    transform: Matrix4x4 {
+                                        property real s: -carousel.skewFactor
+                                        matrix: Qt.matrix4x4(1, s, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  0, 0, 0, 1)
+                                    }
+                                }
+
+                                // High-res overlay — loads asynchronously when held, cross-fades in over the thumbnail
+                                Image {
+                                    id: hiResImage
+                                    anchors.centerIn: parent
+                                    anchors.horizontalCenterOffset: -50
+                                    width: parent.width + (parent.height * Math.abs(carousel.skewFactor)) + 50
+                                    height: parent.height
+                                    fillMode: Image.PreserveAspectCrop
+                                    source: (carousel.heldIndex === delegateRoot.index) ? delegateRoot.fileUrl : ""
+                                    sourceSize: Qt.size(
+                                        Math.ceil(carousel.width * carousel.holdExpandRatio),
+                                        Math.ceil(carousel.height * carousel.holdExpandRatio)
+                                    )
+                                    asynchronous: true
+                                    opacity: (status === Image.Ready && carousel.heldIndex === delegateRoot.index) ? 1.0 : 0.0
+                                    visible: opacity > 0
+
+                                    Behavior on opacity { NumberAnimation { duration: 300; easing.type: Easing.InOutQuad } }
 
                                     transform: Matrix4x4 {
                                         property real s: -carousel.skewFactor

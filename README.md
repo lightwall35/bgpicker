@@ -50,7 +50,7 @@ and `awww` gets `~/awww_wallpapers/A.png`.
 
 ```bash
 # Start the bgpicker daemon (stays in foreground)
-qs -p /home/minec/playground/bgpicker-awww-swaybg
+qs -p /home/lightwall/playground/bgpicker-awww-swaybg
 
 # Or use the convenience script (auto-daemonizes)
 ./bgpicker.sh start
@@ -59,7 +59,7 @@ qs -p /home/minec/playground/bgpicker-awww-swaybg
 Or add to your compositor startup (e.g. in `~/.config/niri/config.kdl`):
 
 ```kdl
-spawn-at-startup "qs" "-p" "/home/minec/playground/bgpicker-awww-swaybg" "-n" "-d"
+spawn-at-startup "qs" "-p" "/home/lightwall/playground/bgpicker-awww-swaybg" "-n" "-d"
 ```
 
 ### 3. Bind keys
@@ -69,23 +69,23 @@ spawn-at-startup "qs" "-p" "/home/minec/playground/bgpicker-awww-swaybg" "-n" "-
 ```kdl
 binds {
     // Toggle the wallpaper carousel
-    Mod+W { spawn "qs" "ipc" "-p" "/home/minec/playground/bgpicker-awww-swaybg" "call" "wallpaperCarousel" "toggle"; }
+    Mod+W { spawn "qs" "ipc" "-p" "/home/lightwall/playground/bgpicker-awww-swaybg" "call" "wallpaperCarousel" "toggle"; }
 
     // Or use the convenience script
-    // Mod+W { spawn "/home/minec/playground/bgpicker-awww-swaybg/bgpicker.sh" "toggle"; }
+    // Mod+W { spawn "/home/lightwall/playground/bgpicker-awww-swaybg/bgpicker.sh" "toggle"; }
 
     // Cycle through wallpapers
-    Mod+Shift+Right { spawn "qs" "ipc" "-p" "/home/minec/playground/bgpicker-awww-swaybg" "call" "wallpaperCarousel" "cycleNext"; }
-    Mod+Shift+Left  { spawn "qs" "ipc" "-p" "/home/minec/playground/bgpicker-awww-swaybg" "call" "wallpaperCarousel" "cyclePrevious"; }
+    Mod+Shift+Right { spawn "qs" "ipc" "-p" "/home/lightwall/playground/bgpicker-awww-swaybg" "call" "wallpaperCarousel" "cycleNext"; }
+    Mod+Shift+Left  { spawn "qs" "ipc" "-p" "/home/lightwall/playground/bgpicker-awww-swaybg" "call" "wallpaperCarousel" "cyclePrevious"; }
 }
 ```
 
 #### Hyprland (`~/.config/hypr/hyprland.conf`)
 
 ```ini
-bind = SUPER, W, exec, qs ipc -p /home/minec/playground/bgpicker-awww-swaybg call wallpaperCarousel toggle
-bind = SUPER SHIFT, Right, exec, qs ipc -p /home/minec/playground/bgpicker-awww-swaybg call wallpaperCarousel cycleNext
-bind = SUPER SHIFT, Left, exec, qs ipc -p /home/minec/playground/bgpicker-awww-swaybg call wallpaperCarousel cyclePrevious
+bind = SUPER, W, exec, qs ipc -p /home/lightwall/playground/bgpicker-awww-swaybg call wallpaperCarousel toggle
+bind = SUPER SHIFT, Right, exec, qs ipc -p /home/lightwall/playground/bgpicker-awww-swaybg call wallpaperCarousel cycleNext
+bind = SUPER SHIFT, Left, exec, qs ipc -p /home/lightwall/playground/bgpicker-awww-swaybg call wallpaperCarousel cyclePrevious
 ```
 
 ## IPC Commands
@@ -98,7 +98,7 @@ bind = SUPER SHIFT, Left, exec, qs ipc -p /home/minec/playground/bgpicker-awww-s
 | `qs ipc -p <path> call wallpaperCarousel cycleNext` | Open + highlight next |
 | `qs ipc -p <path> call wallpaperCarousel cyclePrevious` | Open + highlight previous |
 
-Where `<path>` is `/home/minec/playground/bgpicker-awww-swaybg`.
+Where `<path>` is `/home/lightwall/playground/bgpicker-awww-swaybg`.
 
 ## Keyboard shortcuts (when overlay is open)
 

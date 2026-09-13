@@ -16,11 +16,11 @@ Item {
     // ── Configuration ─────────────────────────────────────────────────────────
     // The directory to browse wallpapers from (displayed in the carousel).
     // This should be your swaybg wallpaper directory.
-    readonly property string dirSwaybg: "/home/minec/swaybg_wallpapers"
+    readonly property string dirSwaybg: "/home/lightwall/swaybg_wallpapers"
 
     // The awww wallpaper directory. Files are matched by filename.
     // When you select "A.png" from swaybg dir, "A.png" from awww dir is used.
-    readonly property string dirAwww: "/home/minec/awww_wallpapers"
+    readonly property string dirAwww: "/home/lightwall/awww_wallpapers"
 
     // Cache file that stores the current swaybg image path
     readonly property string swaybgCacheFile: Quickshell.env("HOME") + "/.cache/current_swaybg_img"
@@ -66,7 +66,7 @@ Item {
             cornerRadius: 12,
             itemWidth: 300,
             itemHeight: 420,
-            borderWidth: 3,
+            borderWidth: 0,
             selectedScale: 108,
             expandSelected: "false",
             expandMultiplier: 120,
