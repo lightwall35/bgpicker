@@ -1,0 +1,17 @@
+{
+  "parallax": {
+    "zoom": 1.12,
+    "columnSpan": 6,
+    "durationMs": 350,
+    "modeTransitionMs": 500,
+    "maxTextureSize": 8192
+  },
+  "transition": {
+    "type": "fade",
+    "durationMs": 800,
+    "fps": 60,
+    "angle": 45,
+    "position": [0.5, 0.5],
+    "wave": [20, 20]
+  }
+}

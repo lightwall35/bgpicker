@@ -19,8 +19,16 @@ Item {
     property var getFocusedScreen: () => null   // () => Screen | null
     property bool hasWallpaperConfigured: true
     property string shellSettingsHint: "Open your shell settings → Wallpaper to configure a wallpaper directory."
+    property string wallpaperMode: ""
+    property bool wallpaperModeBusy: false
+    property bool wallpaperModeAvailable: true
+    property string wallpaperTransition: "fade"
+    property var wallpaperTransitionChoices: []
+    property string wallpaperError: ""
 
     signal wallpaperPicked(string fullPath, string screenName)
+    signal wallpaperModeToggleRequested()
+    signal wallpaperTransitionSelected(string type)
 
     readonly property var overlayScreen: overlay.screen  // wrappers can bind against this
 
@@ -655,6 +663,62 @@ Item {
                     holdTimer.restart();
                 }
             }
+        }
+
+        // Shared skewed controls; stack the two groups on narrow displays.
+        Item {
+            id: wallpaperControls
+            visible: root.wallpaperMode !== ""
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: Math.max(32, Math.min(88, overlay.height * 0.08 - 16))
+            width: Math.min(overlay.width - 64, modeSelector.width + 40 + transitionSelector.width)
+            readonly property bool stacked: width < modeSelector.width + 40 + transitionSelector.width
+            height: stacked ? modeSelector.height + 18 + transitionSelector.height
+                : Math.max(modeSelector.height, transitionSelector.height)
+            z: 210
+
+            SkewSelector {
+                id: modeSelector
+                x: wallpaperControls.stacked ? (parent.width - width) / 2 : 0
+                caption: root.wallpaperModeBusy ? "正在应用" : "壁纸运动"
+                choices: [{value: "awww", label: "普通", icon: "frame"},
+                    {value: "parallax", label: "视差", icon: "layers"}]
+                value: root.wallpaperMode
+                skew: carousel.skewFactor
+                busy: root.wallpaperModeBusy
+                available: root.wallpaperModeAvailable
+                onChosen: root.wallpaperModeToggleRequested()
+            }
+
+            SkewSelector {
+                id: transitionSelector
+                visible: root.wallpaperTransitionChoices.length > 0
+                x: wallpaperControls.stacked ? (parent.width - width) / 2 : modeSelector.width + 40
+                y: wallpaperControls.stacked ? modeSelector.height + 18 : 0
+                caption: "切换效果"
+                choices: root.wallpaperTransitionChoices
+                value: root.wallpaperTransition
+                buttonWidth: Math.min(80, (overlay.width - 96 - 6 * 8) / 7)
+                gap: 8
+                skew: carousel.skewFactor
+                busy: root.wallpaperModeBusy
+                onChosen: type => root.wallpaperTransitionSelected(type)
+            }
+        }
+
+        Text {
+            visible: root.wallpaperError !== ""
+            anchors.bottom: parent.bottom
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.bottomMargin: 36
+            width: Math.min(parent.width - 48, 800)
+            text: root.wallpaperError
+            wrapMode: Text.Wrap
+            horizontalAlignment: Text.AlignHCenter
+            color: "#FFB4AB"
+            font.pixelSize: 14
+            z: 210
         }
 
         // ── Search bar ────────────────────────────────────────────────────────

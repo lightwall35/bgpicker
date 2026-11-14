@@ -1,0 +1,4 @@
+# Keep personal wallpaper originals local; retain the directory in fresh clones.
+/wallpapers/*
+!/wallpapers/.gitkeep
+__pycache__/

@@ -50,7 +50,7 @@ send_ipc() {
     local cmd="$1"
 
     if ! is_running; then
-        start_daemon
+        start_daemon || return
     fi
 
     qs ipc -p "$SCRIPT_DIR" call wallpaperCarousel "$cmd"
@@ -64,6 +64,16 @@ case "${1:-toggle}" in
     stop)
         if is_running; then
             qs kill -p "$SCRIPT_DIR"
+            # qs kill returns before the process exits. Wait so a following
+            # start cannot mistake the dying IPC endpoint for a live daemon.
+            for ((attempt = 0; attempt < 50; attempt++)); do
+                is_running || break
+                sleep 0.1
+            done
+            if is_running; then
+                echo "bgpicker daemon has not stopped yet." >&2
+                exit 1
+            fi
             echo "bgpicker daemon stopped."
         else
             echo "bgpicker daemon is not running."
@@ -84,8 +94,41 @@ case "${1:-toggle}" in
     prev)
         send_ipc "cyclePrevious"
         ;;
+    mode)
+        if [[ $# -eq 1 ]]; then
+            cat -- "${XDG_STATE_HOME:-$HOME/.local/state}/bgpicker/mode" 2>/dev/null || printf 'awww\n'
+        else
+            case "$2" in
+                awww|parallax|toggle) ;;
+                *) echo "Usage: $0 mode [awww|parallax|toggle]" >&2; exit 1 ;;
+            esac
+            is_running || start_daemon || exit 1
+            exec "$SCRIPT_DIR/switch_wallpaper.sh" --mode "$2"
+        fi
+        ;;
+    backdrop-parallax)
+        if [[ $# -eq 1 ]]; then
+            cat -- "${XDG_STATE_HOME:-$HOME/.local/state}/bgpicker/backdrop_parallax" 2>/dev/null || printf 'off\n'
+        elif [[ $# -eq 2 && ( "$2" == on || "$2" == off || "$2" == toggle ) ]]; then
+            is_running || start_daemon || exit 1
+            exec bash "$SCRIPT_DIR/backdrop_parallax.sh" "$2"
+        else
+            echo "Usage: $0 backdrop-parallax [on|off|toggle]" >&2; exit 1
+        fi
+        ;;
+    transition)
+        if [[ $# -eq 1 ]]; then
+            exec python3 "$SCRIPT_DIR/wallpaper_settings.py" show
+        elif [[ $# -eq 2 ]]; then
+            python3 "$SCRIPT_DIR/wallpaper_settings.py" set-transition "$2" || exit 1
+            qs ipc -p "$SCRIPT_DIR" call wallpaperBackend reloadSettings >/dev/null 2>&1 || true
+        else
+            echo "Usage: $0 transition [fade|wipe|wave|grow|outer|random|none]" >&2
+            exit 1
+        fi
+        ;;
     *)
-        echo "Usage: $0 {start|stop|toggle|open|close|next|prev}"
+        echo "Usage: $0 {start|stop|toggle|open|close|next|prev|mode [awww|parallax|toggle]|backdrop-parallax [on|off|toggle]|transition [type]}"
         exit 1
         ;;
 esac

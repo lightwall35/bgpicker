@@ -1,58 +1,88 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
-import Quickshell.Wayland
+import "WallpaperTransitions.js" as Transitions
 
 // ==============================================================================
-// BgPicker — Carousel wrapper for awww + swaybg dual-backend wallpaper picking
+// BgPicker — Carousel wrapper and serialized wallpaper/mode requests.
 //
-// This is a thin adapter that connects the shell-agnostic Carousel.qml
-// to the awww/swaybg wallpaper backends via switch_wallpaper.sh.
+// Connect the shell-agnostic Carousel.qml to the mode-aware switcher.
 // ==============================================================================
 
 Item {
     id: root
+    required property var backend
 
     // ── Configuration ─────────────────────────────────────────────────────────
-    // The directory to browse wallpapers from (displayed in the carousel).
-    // This should be your swaybg wallpaper directory.
-    readonly property string dirSwaybg: "/home/lightwall/swaybg_wallpapers"
-
-    // The awww wallpaper directory. Files are matched by filename.
-    // When you select "A.png" from swaybg dir, "A.png" from awww dir is used.
-    readonly property string dirAwww: "/home/lightwall/awww_wallpapers"
-
-    // Cache file that stores the current swaybg image path
-    readonly property string swaybgCacheFile: Quickshell.env("HOME") + "/.cache/current_swaybg_img"
-
     // Resolved path to the directory containing this QML file (and the scripts)
     readonly property string installDir: {
         let url = Qt.resolvedUrl(".").toString();
         // Strip trailing slash and file:// prefix
         if (url.endsWith("/")) url = url.slice(0, -1);
         if (url.startsWith("file://")) url = url.slice(7);
-        return url;
+        return decodeURIComponent(url);
     }
+
+    // Originals live alongside the project; blurred images are generated on demand.
+    readonly property string wallpaperDir: installDir + "/wallpapers"
+    readonly property string currentWallpaperFile:
+        (Quickshell.env("XDG_STATE_HOME") || Quickshell.env("HOME") + "/.local/state")
+        + "/bgpicker/current_wallpaper"
 
     // ── State ─────────────────────────────────────────────────────────────────
     property string currentWallpaper: ""
+    property var pendingCommand: []
+    property string wallpaperMode: "awww"
+    property string lastError: ""
+    readonly property bool busy: switchProcess.running || preferencesProcess.running || pendingCommand.length > 0
 
-    // ── Read current wallpaper on startup ─────────────────────────────────────
-    Process {
-        id: readCacheProcess
-        command: ["cat", root.swaybgCacheFile]
-        running: true
-        stdout: SplitParser {
-            onRead: data => {
-                const trimmed = data.trim();
-                if (trimmed.length > 0) {
-                    root.currentWallpaper = trimmed;
-                }
-            }
+    // Also observe switches made through the command-line helper.
+    FileView {
+        path: root.currentWallpaperFile
+        preload: true
+        printErrors: false
+        watchChanges: true
+        onLoaded: {
+            root.currentWallpaper = text().replace(/\n$/, "");
+            root.lastError = "";
         }
+        onFileChanged: reload()
     }
 
-    // ── The Carousel (copied verbatim from wallpaperCarousel) ─────────────────
+    FileView {
+        path: root.currentWallpaperFile.slice(0, -"current_wallpaper".length) + "mode"
+        preload: true
+        printErrors: false
+        watchChanges: true
+        onLoaded: {
+            root.wallpaperMode = text().trim() === "parallax" ? "parallax" : "awww";
+            root.lastError = "";
+        }
+        onFileChanged: reload()
+    }
+
+    function processNextWallpaper() {
+        if (switchProcess.running || preferencesProcess.running || pendingCommand.length === 0) return;
+        switchProcess.command = [root.installDir + "/switch_wallpaper.sh"].concat(pendingCommand);
+        pendingCommand = [];
+        lastError = "";
+        switchProcess.running = true;
+    }
+
+    function toggleMode() {
+        if (busy || currentWallpaper === "") return;
+        pendingCommand = ["--mode", "toggle"];
+        processNextWallpaper();
+    }
+
+    function selectTransition(type) {
+        if (busy || type === backend.transition.type) return;
+        lastError = "";
+        preferencesProcess.command = ["python3", installDir + "/wallpaper_settings.py", "set-transition", type];
+        preferencesProcess.running = true;
+    }
+
+    // ── The Carousel ──────────────────────────────────────────────────────────
     Carousel {
         id: carousel
         anchors.fill: parent
@@ -76,56 +106,70 @@ Item {
         })
 
         // Shell integration properties
-        defaultWallpaperFolder: root.dirAwww
+        defaultWallpaperFolder: root.wallpaperDir
         currentWallpaperPath: root.currentWallpaper
         hasWallpaperConfigured: true
-        shellSettingsHint: "Place your wallpapers in:\n" + root.dirSwaybg + "\n" + root.dirAwww
+        shellSettingsHint: "Place your wallpapers in:\n" + root.wallpaperDir
+        wallpaperMode: root.wallpaperMode
+        wallpaperModeBusy: root.busy
+        wallpaperModeAvailable: root.currentWallpaper !== ""
+        wallpaperTransition: root.backend.transition.type
+        wallpaperTransitionChoices: Transitions.choices
+        wallpaperError: root.lastError
+        onWallpaperModeToggleRequested: root.toggleMode()
+        onWallpaperTransitionSelected: type => root.selectTransition(type)
 
         // Screen detection — use first available screen
         // (for multi-monitor, this could be enhanced to detect the focused screen)
         getFocusedScreen: () => Quickshell.screens.length > 0 ? Quickshell.screens[0] : null
 
-        // ── The magic happens here ────────────────────────────────────────────
-        // When the user picks a wallpaper, switch both awww and swaybg
+        // The script resolves the blurred variant; the UI only passes the original.
         onWallpaperPicked: (fullPath, screenName) => {
-            // Update local state immediately
-            root.currentWallpaper = fullPath;
-
-            // fullPath is from awww dir (original images)
-            // Derive the matching swaybg (blurred) path from the filename
-            const fileName = fullPath.split('/').pop();
-            const swaybgPath = root.dirSwaybg + "/" + fileName;
-
-            console.log("BgPicker: Switching wallpapers");
-            console.log("  awww   →", fullPath);
-            console.log("  swaybg →", swaybgPath);
-
-            // Execute the switch script (arg1=swaybg, arg2=awww)
-            // Kill any previous switch process before starting a new one
-            switchProcess.running = false;
-            switchProcess.command = [
-                root.installDir + "/switch_wallpaper.sh",
-                swaybgPath,
-                fullPath
-            ];
-            switchProcess.running = true;
+            root.pendingCommand = [fullPath];
+            root.processNextWallpaper();
         }
     }
 
     // ── Wallpaper switch process ──────────────────────────────────────────────
     Process {
         id: switchProcess
+        stderr: StdioCollector { id: switchErrors }
         onExited: (exitCode, exitStatus) => {
-            if (exitCode !== 0) {
+            if (exitCode !== 0 || exitStatus !== 0) {
+                root.lastError = switchErrors.text.trim() || "壁纸切换失败，请查看 Quickshell 日志。";
                 console.warn("BgPicker: switch_wallpaper.sh exited with code", exitCode);
+            }
+            Qt.callLater(root.processNextWallpaper);
+        }
+    }
+
+    Process {
+        id: preferencesProcess
+        stderr: StdioCollector { id: preferencesErrors }
+        onExited: (exitCode, exitStatus) => {
+            if (exitCode === 0 && exitStatus === 0) {
+                root.backend.reloadSettings();
+            } else {
+                root.lastError = preferencesErrors.text.trim() || "切换效果保存失败。";
+            }
+            Qt.callLater(root.processNextWallpaper);
+        }
+    }
+
+    Timer {
+        interval: 750
+        running: true
+        onTriggered: {
+            if (!root.busy) {
+                root.pendingCommand = ["--restore"];
+                root.processNextWallpaper();
             }
         }
     }
 
     Component.onCompleted: {
         console.info("BgPicker: daemon loaded");
-        console.info("  swaybg dir: " + root.dirSwaybg);
-        console.info("  awww dir:   " + root.dirAwww);
+        console.info("  wallpaper dir: " + root.wallpaperDir);
         console.info("  Toggle with: qs ipc -p " + root.installDir + " call wallpaperCarousel toggle");
     }
 }
