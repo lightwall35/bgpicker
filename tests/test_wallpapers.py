@@ -38,6 +38,7 @@ class WallpaperTests(unittest.TestCase):
         self.env["PATH"] = str(bin_dir) + os.pathsep + os.environ["PATH"]
         self.env["MOCK_LOG"] = str(self.root / "backends.jsonl")
         self.env["MOCK_PID"] = str(self.root / "swaybg.pid")
+        self.env["MOCK_AWWW_DISPLAY"] = str(self.original)
         stub = '''#!/usr/bin/python3
 import json, os, pathlib, sys, time
 name = pathlib.Path(sys.argv[0]).name
@@ -46,6 +47,8 @@ if name == "pgrep":
 with open(os.environ["MOCK_LOG"], "a") as f:
     f.write(json.dumps([name, sys.argv[1:]]) + "\\n")
 if name == "qs":
+    if "call" not in sys.argv:
+        sys.exit(0)
     target = "backdropBackend" if "backdropBackend" in sys.argv else "wallpaperBackend"
     method = sys.argv[sys.argv.index(target) + 1]
     if os.environ.get("MOCK_QS_FAIL"):
@@ -53,16 +56,28 @@ if name == "qs":
     if method == "stage": print("loading")
     elif method == "ready": print(os.environ.get("MOCK_QS_READY", "ready"))
     elif method == "commit": print(os.environ.get("MOCK_QS_COMMIT", "ready"))
+    elif method == "status": print(json.dumps({"active": os.environ.get("MOCK_RENDERER_ACTIVE") == "1"}))
     elif method == "exitMode": print("started")
     elif method == "modeStatus": print(os.environ.get("MOCK_MODE_STATUS", "ready"))
     elif method == "cancelMode": print("cancelled")
     else: print(os.environ.get("MOCK_QS_DEACTIVATE", "awww"))
     sys.exit(0)
+if name == "niri":
+    print(json.dumps({"eDP-2": {"logical": {"x": 0}}}))
+    sys.exit(0)
 if name == "awww":
+    if "--version" in sys.argv:
+        print(os.environ.get("MOCK_AWWW_VERSION", "unknown"))
+        sys.exit(0)
+    if "query" in sys.argv and "--json" not in sys.argv and os.environ.get("MOCK_AWWW_ABSENT"):
+        sys.exit(1)
     if "query" in sys.argv and "--json" in sys.argv:
         calls = [json.loads(line) for line in pathlib.Path(os.environ["MOCK_LOG"]).read_text().splitlines()]
         images = [c[1][1] for c in calls if c[0] == "awww" and c[1][0] == "img" and "--namespace" not in c[1]]
-        print(json.dumps({"": [{"displaying": {"image": images[-1] if images else ""}}]}))
+        queries = sum(c[0] == "awww" and "query" in c[1] and "--json" in c[1] for c in calls)
+        display = images[-1] if images else os.environ.get("MOCK_AWWW_DISPLAY", "")
+        if not images and queries <= int(os.environ.get("MOCK_AWWW_DELAY_QUERIES", "0")): display = ""
+        print(json.dumps({"": [{"displaying": {"image": display}}]}))
         sys.exit(0)
     if "--namespace" in sys.argv and "img" in sys.argv and os.environ.get("MOCK_BACKDROP_FAIL"):
         sys.exit(1)
@@ -76,7 +91,7 @@ if name == "swaybg":
     time.sleep(30)
 sys.exit(int(os.environ.get("MOCK_AWWW_EXIT", "0")))
 '''
-        for name in ["awww", "swaybg", "pgrep", "qs"]:
+        for name in ["awww", "awww-daemon", "niri", "swaybg", "pgrep", "qs"]:
             command = bin_dir / name
             command.write_text(stub)
             command.chmod(0o755)
@@ -319,6 +334,79 @@ sys.exit(int(os.environ.get("MOCK_AWWW_EXIT", "0")))
         blur = Path((self.root / "home/.cache/current_swaybg_img").read_text().strip())
         self.assertTrue(blur.is_file())
         self.assertIn('"commit"', (self.root / "backends.jsonl").read_text())
+
+    def test_restore_commits_before_clearing_startup_wallpaper(self):
+        self.mock_backends()
+        state = self.root / "state/bgpicker"
+        state.mkdir(parents=True)
+        (state / "mode").write_text("parallax\n")
+        (state / "current_wallpaper").write_text(str(self.original) + "\n")
+        self.run_command([str(PROJECT / "switch_wallpaper.sh"), "--restore"])
+        calls = [json.loads(line) for line in (self.root / "backends.jsonl").read_text().splitlines()]
+        commit = next(i for i, c in enumerate(calls) if c[0] == "qs" and "wallpaperBackend" in c[1] and "commit" in c[1])
+        mode_status = next(i for i, c in enumerate(calls) if c[0] == "qs" and "wallpaperBackend" in c[1] and "modeStatus" in c[1])
+        clear = next(i for i, c in enumerate(calls) if c[0] == "awww" and c[1] == ["clear", "00000000"])
+        self.assertEqual(json.loads(calls[commit][1][-1])["modeSwitch"], "enter")
+        self.assertEqual(json.loads(calls[commit][1][-1])["durationMs"], 0)
+        self.assertLess(commit, mode_status)
+        self.assertLess(mode_status, clear)
+        self.assertFalse(any(c[0] == "awww" and c[1][0] == "img" and "--namespace" not in c[1] for c in calls))
+
+    def test_restore_active_renderer_does_not_restart_mode_animation(self):
+        self.mock_backends()
+        self.env["MOCK_RENDERER_ACTIVE"] = "1"
+        state = self.root / "state/bgpicker"
+        state.mkdir(parents=True)
+        (state / "mode").write_text("parallax\n")
+        (state / "current_wallpaper").write_text(str(self.original) + "\n")
+        self.run_command([str(PROJECT / "switch_wallpaper.sh"), "--restore"])
+        calls = [json.loads(line) for line in (self.root / "backends.jsonl").read_text().splitlines()]
+        commit = next(c[1] for c in calls if c[0] == "qs" and "wallpaperBackend" in c[1] and "commit" in c[1])
+        self.assertNotIn("modeSwitch", json.loads(commit[-1]))
+        self.assertFalse(any(c[0] == "qs" and "wallpaperBackend" in c[1] and "modeStatus" in c[1] for c in calls))
+        self.assertFalse(any(c[0] == "awww" and "query" in c[1] and "--json" in c[1] for c in calls))
+
+    def test_restore_animation_failure_keeps_awww_visible(self):
+        self.mock_backends()
+        self.env["MOCK_MODE_STATUS"] = "error: display changed"
+        state = self.root / "state/bgpicker"
+        state.mkdir(parents=True)
+        (state / "mode").write_text("parallax\n")
+        (state / "current_wallpaper").write_text(str(self.original) + "\n")
+        result = self.run_command([str(PROJECT / "switch_wallpaper.sh"), "--restore"], check=False)
+        self.assertNotEqual(result.returncode, 0)
+        calls = [json.loads(line) for line in (self.root / "backends.jsonl").read_text().splitlines()]
+        self.assertTrue(any(c[0] == "qs" and "wallpaperBackend" in c[1] and "deactivate" in c[1] for c in calls))
+        self.assertFalse(any(c[0] == "awww" and c[1] == ["clear", "00000000"] for c in calls))
+        self.assertEqual((state / "mode").read_text(), "parallax\n")
+
+    def test_restore_waits_for_delayed_cached_image(self):
+        self.mock_backends()
+        self.env["MOCK_AWWW_DELAY_QUERIES"] = "2"
+        state = self.root / "state/bgpicker"
+        state.mkdir(parents=True)
+        (state / "mode").write_text("parallax\n")
+        (state / "current_wallpaper").write_text(str(self.original) + "\n")
+        self.run_command([str(PROJECT / "switch_wallpaper.sh"), "--restore"])
+        calls = [json.loads(line) for line in (self.root / "backends.jsonl").read_text().splitlines()]
+        queries = [i for i, c in enumerate(calls) if c[0] == "awww" and "query" in c[1] and "--json" in c[1]]
+        commit = next(i for i, c in enumerate(calls) if c[0] == "qs" and "wallpaperBackend" in c[1] and "commit" in c[1])
+        self.assertGreaterEqual(len(queries), 3)
+        self.assertLess(queries[2], commit)
+        self.assertFalse(any(c[0] == "awww" and c[1][0] == "img" and "--namespace" not in c[1] for c in calls))
+
+    def test_restore_falls_back_when_cached_image_is_stale(self):
+        self.mock_backends()
+        self.env["MOCK_AWWW_DISPLAY"] = "/stale.png"
+        state = self.root / "state/bgpicker"
+        state.mkdir(parents=True)
+        (state / "mode").write_text("parallax\n")
+        (state / "current_wallpaper").write_text(str(self.original) + "\n")
+        self.run_command([str(PROJECT / "switch_wallpaper.sh"), "--restore"])
+        calls = [json.loads(line) for line in (self.root / "backends.jsonl").read_text().splitlines()]
+        image = next(i for i, c in enumerate(calls) if c == ["awww", ["img", str(self.original), "--transition-type", "none"]])
+        commit = next(i for i, c in enumerate(calls) if c[0] == "qs" and "wallpaperBackend" in c[1] and "commit" in c[1])
+        self.assertLess(image, commit)
 
     def test_restore_without_selection_is_noop(self):
         self.mock_backends()

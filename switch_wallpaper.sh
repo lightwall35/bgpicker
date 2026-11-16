@@ -59,9 +59,6 @@ TRANSITION_DATA="$(python3 "$SCRIPT_DIR/wallpaper_settings.py" resolve "${RESOLV
 mapfile -t TRANSITION_FIELDS <<< "$TRANSITION_DATA"
 TRANSITION_JSON="${TRANSITION_FIELDS[0]}"
 TRANSITION_ARGS=("${TRANSITION_FIELDS[@]:1}")
-if $SMOOTH_ENTER; then
-    TRANSITION_JSON="$(python3 -c 'import json,sys; x=json.loads(sys.argv[1]); x["modeSwitch"]="enter"; print(json.dumps(x,separators=(",",":")))' "$TRANSITION_JSON")"
-fi
 BLURRED="$("$SCRIPT_DIR/prepare_wallpaper.sh" "$ORIGINAL")"
 
 # Only retire the legacy swaybg that uses this project's cached image.
@@ -77,10 +74,17 @@ SWITCH_COMPLETED=false
 STAGED=false
 AWWW_CLEARED=false
 MODE_EXIT_STARTED=false
+COLD_RESTORE=false
+COLD_RESTORE_COMMITTED=false
 backend() {
     timeout 3 qs ipc -p "$SCRIPT_DIR" call wallpaperBackend "$@" 9>&-
 }
 cleanup() {
+    if ! $SWITCH_COMPLETED && $COLD_RESTORE_COMMITTED; then
+        if $AWWW_CLEARED; then awww img "$ORIGINAL" --transition-type none 9>&- >/dev/null 2>&1 || true; fi
+        backend deactivate >/dev/null 2>&1 || true
+        MAIN_CHANGED=false
+    fi
     if ! $SWITCH_COMPLETED && $MODE_EXIT_STARTED; then backend cancelMode >/dev/null 2>&1 || true; fi
     if $STAGED; then backend cancel "$ORIGINAL" >/dev/null 2>&1 || true; fi
     if $STAGED && $AWWW_CLEARED && [[ "$PREVIOUS_MODE" == awww && -f "$PREVIOUS_ORIGINAL" ]]; then
@@ -176,6 +180,24 @@ await_awww_image() {
     return 1
 }
 
+await_awww_startup() {
+    # The daemon and QS start independently. Give awww time to finish its own
+    # cached restore, without issuing a redundant img request in the usual case.
+    for ((attempt=0; attempt<30; attempt++)); do
+        if timeout 2 awww query --json 9>&- 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin).get("",[]); sys.exit(not d or not all(x.get("displaying",{}).get("image")==sys.argv[1] for x in d))' "$ORIGINAL" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    # A stale/unsupported cache or a new output needs a normal awww request.
+    if ! awww query 9>&- >/dev/null 2>&1; then
+        echo 'BgPicker: awww was not ready during wallpaper restore' >&2
+        return 1
+    fi
+    awww img "$ORIGINAL" --transition-type none 9>&- || return 1
+    await_awww_image
+}
+
 if [[ "$MODE" == parallax ]]; then
     # Decode off-screen on every output before exposing the new wallpaper.
     STAGED=true
@@ -197,21 +219,31 @@ if [[ "$MODE" == parallax ]]; then
         sleep 0.1
     done
     $READY || { echo "BgPicker: parallax image/niri IPC timed out" >&2; exit 1; }
-    # Both surfaces stay on Background, below desktop widgets. Clear awww's
-    # content rather than relying on creation order between wallpaper surfaces.
-    if ! $SMOOTH_ENTER && awww query 9>&- >/dev/null 2>&1; then
-        awww clear 00000000 9>&-
-        AWWW_CLEARED=true
+    if $RESTORE; then
+        STATUS="$(backend status)" || { echo 'BgPicker: could not inspect the renderer state' >&2; exit 1; }
+        ACTIVE="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); v=d.get("active"); assert isinstance(v,bool); print("true" if v else "false")' "$STATUS")" || { echo 'BgPicker: invalid renderer state' >&2; exit 1; }
+        if [[ "$ACTIVE" == false ]]; then
+            await_awww_startup
+            COLD_RESTORE=true
+            SMOOTH_ENTER=true
+        fi
+    fi
+    if $SMOOTH_ENTER; then
+        TRANSITION_JSON="$(python3 -c 'import json,sys; x=json.loads(sys.argv[1]); x["modeSwitch"]="enter"; print(json.dumps(x,separators=(",",":")))' "$TRANSITION_JSON")"
     fi
     BACKDROP_TOUCHED=true
     apply_backdrop &
     BACKDROP_PID=$!
     RESULT="$(backend commit "$ORIGINAL" "$TRANSITION_JSON")" || RESULT="error: renderer unavailable"
     [[ "$RESULT" == ready ]] && MAIN_CHANGED=true
+    if $COLD_RESTORE && [[ "$RESULT" == ready ]]; then COLD_RESTORE_COMMITTED=true; fi
     wait "$BACKDROP_PID" || { echo "BgPicker: backdrop update failed" >&2; exit 1; }
     [[ "$RESULT" == ready ]] || { echo "BgPicker: $RESULT" >&2; exit 1; }
-    if $SMOOTH_ENTER; then
-        await_mode_transition
+    if $SMOOTH_ENTER; then await_mode_transition; fi
+    if awww query 9>&- >/dev/null 2>&1; then
+        # IPC commit only schedules the first frame. Give Qt and the compositor
+        # a brief opportunity to display it before removing the fallback.
+        sleep 0.1
         awww clear 00000000 9>&-
         AWWW_CLEARED=true
     fi
@@ -221,7 +253,9 @@ else
     apply_backdrop &
     BACKDROP_PID=$!
     MAIN_RESULT=0
-    if $SMOOTH_EXIT; then
+    if $RESTORE; then
+        await_awww_startup || MAIN_RESULT=$?
+    elif $SMOOTH_EXIT; then
         awww img "$ORIGINAL" --transition-type none 9>&- || MAIN_RESULT=$?
     else
         awww img "$ORIGINAL" "${TRANSITION_ARGS[@]}" 9>&- || MAIN_RESULT=$?
@@ -255,6 +289,11 @@ mv -f -- "$SWAYBG_CACHE.tmp.$$" "$SWAYBG_CACHE"
 
 BACKDROP_TOUCHED=false
 SWITCH_COMPLETED=true
+# This is only a startup optimization. An unknown awww version or inaccessible
+# cache must not undo a successful wallpaper switch; startup has a fallback.
+if [[ "$MODE" == parallax ]]; then
+    python3 "$SCRIPT_DIR/sync_awww_cache.py" "$ORIGINAL" 9>&- || true
+fi
 if [[ -n "$PREVIOUS_BLUR" ]]; then
     while IFS= read -r pid; do
         cmdline="/proc/$pid/cmdline"
