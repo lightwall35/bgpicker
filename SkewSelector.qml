@@ -17,6 +17,7 @@ Column {
     opacity: available ? 1 : 0.4
 
     Text {
+        visible: root.caption !== ""
         anchors.horizontalCenter: parent.horizontalCenter
         text: root.caption
         color: "#70FFFFFF"

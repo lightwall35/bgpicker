@@ -4,6 +4,7 @@ import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
 import QtQuick.Effects
+import "CarouselMedia.js" as Media
 
 Item {
     id: root
@@ -25,7 +26,45 @@ Item {
     property string wallpaperTransition: "fade"
     property var wallpaperTransitionChoices: []
     property string wallpaperError: ""
+    property var videoCatalog: []
+    property string currentVideoPath: ""
+    property string videoFolder: ""
+    property bool videoPage: false
+    property bool _constructed: false
+    property real _wheelAccum: 0
+    property bool _pageCapturePending: false
+    property bool _pageAnimating: false
+    property real _pageProgress: 1
+    property int _pageDirection: -1
+    property string _modelPage: "images"
+    property var _pageGrab: null
+    property var _pageSelections: ({images: "", videos: ""})
+    readonly property int activeEntryCount: videoPage ? videoCatalog.length : folderModel.count
+    readonly property string activeCurrentPath: videoPage ? currentVideoPath : currentWallpaperPath
+    readonly property var activeEntries: videoPage ? Media.videos(videoCatalog) : (_folderCache[wallpaperFolder] || [])
+    readonly property var _pageGeometry: Media.pageGeometry(_pageProgress, _pageDirection, 180)
+    property bool _modelSyncPending: false
+    property int _pageGeneration: 0
+    onVideoCatalogChanged: {
+        if (videoPage) _syncActiveModel();
+        root._rebuildCacheEntries();
+    }
+    onVideoPageChanged: {
+        if (!_constructed) return;
+        carousel.initialFocusSet = false;
+        searchInput.text = "";
+        carousel.searchVisible = false;
+        // This is the intentional incoming row swap. External catalog refreshes
+        // defer during the animation; this swap must happen before it starts.
+        _syncActiveModel(true);
+    }
+    onCurrentVideoPathChanged: {
+        if (videoPage) root._currentCacheIndex = root._findCurrentIndex();
+        root._rebuildCacheEntries();
+    }
 
+    readonly property bool isOpen: overlay.visible
+    signal opened()
     signal wallpaperPicked(string fullPath, string screenName)
     signal wallpaperModeToggleRequested()
     signal wallpaperTransitionSelected(string type)
@@ -50,7 +89,8 @@ Item {
     property var _folderCache: ({})
     property bool _initialSyncDone: false
     property int _currentCacheIndex: -1
-    property var _cacheEntries: []
+    property var _imageCacheEntries: []
+    property var _videoCacheEntries: []
 
     readonly property var _nameFilters: [
         "*.jpg", "*.jpeg", "*.png", "*.webp", "*.gif",
@@ -58,22 +98,16 @@ Item {
     ]
 
     onCurrentWallpaperPathChanged: {
-        if (folderModel.status === FolderListModel.Ready && folderModel.count > 0) {
+        if (!videoPage && folderModel.status === FolderListModel.Ready && folderModel.count > 0)
             root._currentCacheIndex = root._findCurrentIndex();
+        if (folderModel.status === FolderListModel.Ready && folderModel.count > 0)
             root._rebuildCacheEntries();
-        }
     }
 
     onWallpaperFolderUrlChanged: {
         modelSyncTimer.stop();
-        const cached = _folderCache[wallpaperFolder];
-        if (cached) {
-            _populateStableModel(cached);
-            carousel.tryFocus();
-        } else {
-            stableModel.clear();
-        }
         root._initialSyncDone = false;
+        if (!root.videoPage) root._syncActiveModel();
     }
 
     ListModel { id: stableModel }
@@ -109,39 +143,55 @@ Item {
         for (var i = 0; i < model.count; i++)
             entries.push({
                 fileName: model.get(i, "fileName"),
-                fileUrl:  model.get(i, "fileUrl").toString()
+                fileUrl: model.get(i, "fileUrl").toString(),
+                originalPath: model.get(i, "filePath")
             });
         return entries;
     }
 
+    function _entriesForCurrentPage() {
+        // Read the source properties directly: a property-changed handler can
+        // run before QML has invalidated another binding derived from it.
+        return root.videoPage ? Media.videos(root.videoCatalog) : (root._folderCache[root.wallpaperFolder] || []);
+    }
+
     function _findCurrentIndex() {
-        const fileName = (root.currentWallpaperPath || "").split('/').pop();
-        if (!fileName) return 0;
-        for (let i = 0; i < folderModel.count; i++) {
-            if (folderModel.get(i, "fileName") === fileName)
-                return i;
+        const name = ((root.videoPage ? root.currentVideoPath : root.currentWallpaperPath) || "").split('/').pop();
+        const entries = root._entriesForCurrentPage();
+        for (let i = 0; i < entries.length; i++) {
+            if (entries[i].fileName === name) return i;
         }
         return 0;
     }
 
-    function _rebuildCacheEntries() {
-        const count = folderModel.count;
-        if (count === 0) { root._cacheEntries = []; return; }
-        const center = root._currentCacheIndex >= 0 ? root._currentCacheIndex : root._findCurrentIndex();
+    function _setCacheList(key, urls) {
+        const current = root[key];
+        if (current.length === urls.length && current.every((u, i) => u === urls[i])) return;
+        root[key] = urls;
+    }
+
+    function _cacheWindowUrls(entries, currentPath) {
+        if (!entries || entries.length === 0) return [];
+        const name = (currentPath || "").split('/').pop();
+        let center = 0;
+        for (let i = 0; i < entries.length; i++) {
+            if (entries[i].fileName === name) {
+                center = i;
+                break;
+            }
+        }
         const radius = Math.floor(((root.cfg.cacheSize !== undefined) ? parseInt(root.cfg.cacheSize) : 200) / 2);
-        const start = Math.max(0, center - radius);
-        const end = Math.min(count - 1, center + radius);
-        const entries = [];
-        for (let i = start; i <= end; i++)
-            entries.push(folderModel.get(i, "fileUrl").toString());
-        root._cacheEntries = entries;
+        return entries.slice(Math.max(0, center - radius), center + radius + 1).map(e => e.fileUrl);
+    }
+
+    function _rebuildCacheEntries() {
+        root._setCacheList("_imageCacheEntries", _cacheWindowUrls(root._folderCache[root.wallpaperFolder] || [], root.currentWallpaperPath));
+        root._setCacheList("_videoCacheEntries", _cacheWindowUrls(Media.videos(root.videoCatalog), root.currentVideoPath));
     }
 
     function _populateStableModel(entries) {
         const activeView = root._currentView;
-        const savedIndex = activeView.currentIndex;
-        const savedFile = (savedIndex >= 0 && savedIndex < stableModel.count)
-            ? stableModel.get(savedIndex).fileName : "";
+        const savedFile = activeView.currentItem ? activeView.currentItem.fileName : "";
 
         stableModel.clear();
         for (let i = 0; i < entries.length; i++)
@@ -158,38 +208,117 @@ Item {
             }
         }
 
+        let restoreIndex = entries.length ? 0 : -1;
         if (savedFile) {
             for (let i = 0; i < stableModel.count; i++) {
                 if (stableModel.get(i).fileName === savedFile) {
-                    activeView.currentIndex = i;
+                    restoreIndex = i;
                     break;
                 }
             }
         }
+        activeView.currentIndex = restoreIndex;
+        // ListView batches model changes; flush them before reading count or
+        // restoring a page's selected item, especially on a shorter new page.
+        listView.forceLayout();
     }
 
     function _syncStableModel() {
         const entries = _readFolderModel(folderModel);
-        root._folderCache[root.wallpaperFolder] = entries;
-        _populateStableModel(entries);
+        const cache = Object.assign({}, root._folderCache);
+        cache[root.wallpaperFolder] = entries;
+        root._folderCache = cache;
+        if (!root.videoPage) _syncActiveModel();
+        else root._rebuildCacheEntries();
+    }
+
+    Component.onCompleted: {
+        root._constructed = true;
+        root._syncActiveModel();
+    }
+
+    function _syncActiveModel(force) {
+        if (!root._constructed) return;
+        if (!force && (root._pageAnimating || root._pageCapturePending)) {
+            root._modelSyncPending = true;
+            return;
+        }
+        root._modelSyncPending = false;
+        const pageKey = root.videoPage ? "videos" : "images";
+        const selected = root._currentView.currentItem;
+        if (root._modelPage === pageKey && carousel.initialFocusSet && selected)
+            root._pageSelections[pageKey] = selected.fileName;
+        root._modelPage = pageKey;
+        _populateStableModel(root._entriesForCurrentPage());
+        carousel.initialFocusSet = false;
         root._currentCacheIndex = root._findCurrentIndex();
         root._rebuildCacheEntries();
-        _applySearch();
+        _applySearch(true);
         carousel.tryFocus();
     }
 
-    function _applySearch() {
-        const text = carousel._searchText.toLowerCase();
-        const allEntries = root._folderCache[root.wallpaperFolder] || [];
+    function _flushPendingSync() {
+        if (root._modelSyncPending && !root._pageAnimating && !root._pageCapturePending)
+            root._syncActiveModel();
+    }
+
+    function _applySearch(preserveSelection) {
+        const selectedFile = preserveSelection && listView.currentItem ? listView.currentItem.fileName : "";
+        const entries = Media.filter(root._entriesForCurrentPage(), carousel._searchText);
         filteredModel.clear();
-        const entries = text.length === 0
-            ? allEntries
-            : allEntries.filter(e => e.fileName.toLowerCase().indexOf(text) !== -1);
         for (let i = 0; i < entries.length; i++)
             filteredModel.append(entries[i]);
         if (filteredModel.count > 0 && carousel.searchActive) {
-            listView.currentIndex = 0;
-            listView.positionViewAtIndex(0, ListView.Center);
+            const index = Math.max(0, Media.selectedIndex(entries, selectedFile, ""));
+            listView.currentIndex = index;
+            listView.positionViewAtIndex(index, ListView.Center);
+        }
+    }
+
+    function requestMediaPage(page) {
+        const wantVideo = page === "video";
+        if (wantVideo === root.videoPage || root._pageAnimating || root._pageCapturePending
+                || root.wallpaperModeBusy || !overlay.visible || pageCooldown.running) return false;
+        root._pageCapturePending = true;
+        const generation = ++root._pageGeneration;
+        root._pageDirection = wantVideo ? -1 : 1;
+        const current = root._currentView.currentItem;
+        root._pageSelections[root.videoPage ? "videos" : "images"] = current ? current.fileName : "";
+        const captured = carousel.grabToImage(result => {
+            if (generation !== root._pageGeneration) return;
+            root._pageCapturePending = false;
+            if (!overlay.visible) { root._flushPendingSync(); return; }
+            root._pageGrab = result;
+            outgoingRow.source = result.url;
+            root._pageProgress = 0;
+            root._pageAnimating = true;
+            root.videoPage = wantVideo;
+            Qt.callLater(() => {
+                root._currentView.forceActiveFocus();
+                pageAnimation.restart();
+            });
+        });
+        if (!captured) root._pageCapturePending = false;
+        return captured;
+    }
+
+    Timer { id: pageCooldown; interval: 180 }
+    NumberAnimation {
+        id: pageAnimation
+        target: root
+        property: "_pageProgress"
+        from: 0
+        to: 1
+        duration: 460
+        easing.type: Easing.BezierSpline
+        easing.bezierCurve: [0.2, 0, 0.18, 1, 1, 1]
+        onFinished: {
+            root._pageAnimating = false;
+            outgoingRow.source = "";
+            root._pageGrab = null;
+            root._flushPendingSync();
+            pageCooldown.restart();
+            Qt.callLater(() => root._currentView.forceActiveFocus());
         }
     }
 
@@ -199,6 +328,7 @@ Item {
     }
 
     function open() {
+        root._pageSelections = {images: "", videos: ""};
         carousel.initialFocusSet = false;
         const focusedScreen = root.getFocusedScreen();
         if (focusedScreen)
@@ -208,10 +338,19 @@ Item {
         carousel.searchVisible = false;
         carousel.tryFocus();
         Qt.callLater(() => root._currentView.forceActiveFocus());
+        root.opened();
     }
 
     function close() {
         overlay.visible = false;
+        root._pageGeneration++;
+        root._pageCapturePending = false;
+        pageAnimation.stop();
+        root._pageAnimating = false;
+        root._pageProgress = 1;
+        outgoingRow.source = "";
+        root._pageGrab = null;
+        root._flushPendingSync();
     }
 
     function cycle(direction: int): string {
@@ -233,6 +372,21 @@ Item {
         function close(): string    { if (overlay.visible) root.close(); return "closed"; }
         function cycleNext(): string     { return root.cycle(+1); }
         function cyclePrevious(): string { return root.cycle(-1); }
+        function showVideos(): string { return root.requestMediaPage("video") ? "switching" : "unchanged"; }
+        function showImages(): string { return root.requestMediaPage("static") ? "switching" : "unchanged"; }
+        function applySelection(): string {
+            if (root._pageAnimating || root._pageCapturePending || root.wallpaperModeBusy || carousel.confirmingIndex >= 0)
+                return "busy";
+            if (!overlay.visible || !root._currentView.currentItem) return "unavailable";
+            root._currentView.currentItem.pickWallpaper();
+            return "applied";
+        }
+        function status(): string {
+            return JSON.stringify({visible: overlay.visible, page: root.videoPage ? "video" : "static",
+                changingPage: root._pageAnimating || root._pageCapturePending,
+                count: root.activeEntryCount, index: root._currentView.currentIndex,
+                selectedPath: root._currentView.currentItem ? root._currentView.currentItem.originalPath : ""});
+        }
     }
 
     // ── Fullscreen overlay window ─────────────────────────────────────────────
@@ -261,12 +415,32 @@ Item {
             onClicked: root.close()
         }
 
+        WheelHandler {
+            target: null
+            acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+            orientation: Qt.Vertical
+            onWheel: event => {
+                const amount = event.angleDelta.y || event.pixelDelta.y;
+                if (root._pageAnimating || root._pageCapturePending || pageCooldown.running) root._wheelAccum = 0;
+                else {
+                    if (amount * root._wheelAccum < 0) root._wheelAccum = 0;
+                    root._wheelAccum += amount;
+                    if (Math.abs(root._wheelAccum) >= 40) {
+                        root.requestMediaPage(root._wheelAccum < 0 ? "video" : "static");
+                        root._wheelAccum = 0;
+                    }
+                }
+                event.accepted = true;
+            }
+        }
+
         // ── Carousel ──────────────────────────────────────────────────────────
         Item {
             id: carousel
             anchors.fill: parent
-            opacity: overlay.visible ? 1 : 0
-            Behavior on opacity { NumberAnimation { duration: 150 } }
+            opacity: overlay.visible ? (root._pageAnimating ? root._pageGeometry.incomingOpacity : 1) : 0
+            transform: Translate { y: root._pageAnimating ? root._pageGeometry.incomingY : 0 }
+            enabled: !root._pageAnimating && !root._pageCapturePending
 
             property bool initialFocusSet: false
             property string _searchText: ""
@@ -276,16 +450,12 @@ Item {
             function tryFocus() {
                 if (initialFocusSet) return;
 
-                let targetIndex = 0;
-                const currentFile = (root.currentWallpaperPath || "").split('/').pop();
-                if (currentFile && stableModel.count > 0) {
-                    for (let i = 0; i < stableModel.count; i++) {
-                        if (stableModel.get(i).fileName === currentFile) {
-                            targetIndex = i;
-                            break;
-                        }
-                    }
-                }
+                const model = carousel.searchActive ? filteredModel : stableModel;
+                const entries = [];
+                for (let i = 0; i < model.count; i++) entries.push({fileName: model.get(i).fileName});
+                const targetIndex = Math.max(0, Media.selectedIndex(entries,
+                    root._pageSelections[root.videoPage ? "videos" : "images"],
+                    root.videoPage ? root.currentVideoPath : root.currentWallpaperPath));
 
                 const v = root._currentView;
                 if (v.count > 0) {
@@ -302,12 +472,13 @@ Item {
 
             readonly property int itemWidth:    parseInt(root.cfg.itemWidth)  || 300
             readonly property int itemHeight:   parseInt(root.cfg.itemHeight) || 420
+            readonly property size thumbnailSourceSize: Qt.size(2560, carousel.itemHeight * 2)
             readonly property int borderWidth:  (root.cfg.borderWidth  !== undefined) ? parseInt(root.cfg.borderWidth)  : 3
             readonly property int overlayOpacity: (root.cfg.overlayOpacity !== undefined) ? parseInt(root.cfg.overlayOpacity) : 80
             readonly property int cornerRadius: (root.cfg.cornerRadius !== undefined) ? parseInt(root.cfg.cornerRadius) : 0
             readonly property bool enableRounding: cornerRadius > 0
             readonly property real skewFactor: -0.35
-            readonly property int _baseWallpaperCount: folderModel.count
+            readonly property int _baseWallpaperCount: root.activeEntryCount
 
             readonly property real selectedScale: {
                 let val = (root.cfg.selectedScale !== undefined) ? parseFloat(root.cfg.selectedScale) : 108;
@@ -363,6 +534,7 @@ Item {
                     required property int index
                     required property string fileName
                     required property string fileUrl
+                    required property string originalPath
 
                     readonly property bool _effectivelyInfinite: root._isInfinite && !carousel.searchActive
 
@@ -404,8 +576,8 @@ Item {
                     z: carousel.confirmingIndex === index ? 100 : isCurrent ? 10 : Math.max(1, 10 - distFromCenter)
 
                     function pickWallpaper() {
-                        if (carousel.confirmingIndex >= 0) return;
-                        carousel.confirmPick(index, root.wallpaperFolder + "/" + fileName);
+                        if (carousel.confirmingIndex >= 0 || root._pageAnimating || root.wallpaperModeBusy) return;
+                        carousel.confirmPick(index, originalPath);
                     }
 
                     MouseArea {
@@ -513,7 +685,7 @@ Item {
                                     height: parent.height
                                     fillMode: Image.PreserveAspectCrop
                                     source: delegateRoot.fileUrl
-                                    sourceSize: Qt.size(carousel.itemWidth, carousel.itemHeight)
+                                    sourceSize: carousel.thumbnailSourceSize
                                     asynchronous: true
 
                                     transform: Matrix4x4 {
@@ -532,8 +704,8 @@ Item {
                                     fillMode: Image.PreserveAspectCrop
                                     source: (carousel.heldIndex === delegateRoot.index) ? delegateRoot.fileUrl : ""
                                     sourceSize: Qt.size(
-                                        Math.ceil(carousel.width * carousel.holdExpandRatio),
-                                        Math.ceil(carousel.height * carousel.holdExpandRatio)
+                                        Math.max(carousel.thumbnailSourceSize.width, Math.ceil(carousel.width * carousel.holdExpandRatio * 2)),
+                                        Math.max(carousel.thumbnailSourceSize.height, Math.ceil(carousel.height * carousel.holdExpandRatio * 2))
                                     )
                                     asynchronous: true
                                     opacity: (status === Image.Ready && carousel.heldIndex === delegateRoot.index) ? 1.0 : 0.0
@@ -665,6 +837,16 @@ Item {
             }
         }
 
+        Image {
+            id: outgoingRow
+            anchors.fill: parent
+            visible: root._pageAnimating
+            opacity: root._pageGeometry.outgoingOpacity
+            transform: Translate { y: root._pageGeometry.outgoingY }
+            fillMode: Image.Stretch
+            z: 100
+        }
+
         // Shared skewed controls; stack the two groups on narrow displays.
         Item {
             id: wallpaperControls
@@ -681,7 +863,6 @@ Item {
             SkewSelector {
                 id: modeSelector
                 x: wallpaperControls.stacked ? (parent.width - width) / 2 : 0
-                caption: root.wallpaperModeBusy ? "正在应用" : "壁纸运动"
                 choices: [{value: "awww", label: "普通", icon: "frame"},
                     {value: "parallax", label: "视差", icon: "layers"}]
                 value: root.wallpaperMode
@@ -696,7 +877,6 @@ Item {
                 visible: root.wallpaperTransitionChoices.length > 0
                 x: wallpaperControls.stacked ? (parent.width - width) / 2 : modeSelector.width + 40
                 y: wallpaperControls.stacked ? modeSelector.height + 18 : 0
-                caption: "切换效果"
                 choices: root.wallpaperTransitionChoices
                 value: root.wallpaperTransition
                 buttonWidth: Math.min(80, (overlay.width - 96 - 6 * 8) / 7)
@@ -802,7 +982,7 @@ Item {
         Column {
             anchors.centerIn: parent
             spacing: 12
-            visible: overlay.visible && (root.cfg.wallpaperDirectory ?? "").trim() && folderModel.status !== FolderListModel.Ready
+            visible: !root.videoPage && overlay.visible && (root.cfg.wallpaperDirectory ?? "").trim() && folderModel.status !== FolderListModel.Ready
 
             Text {
                 anchors.horizontalCenter: parent.horizontalCenter
@@ -825,16 +1005,16 @@ Item {
         Column {
             anchors.centerIn: parent
             spacing: 12
-            visible: overlay.visible && folderModel.status === FolderListModel.Ready && folderModel.count === 0
+            visible: overlay.visible && root.activeEntryCount === 0 && (root.videoPage || folderModel.status === FolderListModel.Ready)
 
             Text {
                 anchors.horizontalCenter: parent.horizontalCenter
-                text: root.hasWallpaperConfigured ? "No images found in wallpaper folder" : "No wallpaper configured"
+                text: root.videoPage ? "动态壁纸文件夹为空" : root.hasWallpaperConfigured ? "No images found in wallpaper folder" : "No wallpaper configured"
                 font.pixelSize: 24; font.bold: true; color: "white"
             }
             Text {
                 anchors.horizontalCenter: parent.horizontalCenter
-                text: root.hasWallpaperConfigured
+                text: root.videoPage ? "将视频放入 " + root.videoFolder : root.hasWallpaperConfigured
                     ? "The folder '" + root.wallpaperFolder + "' is empty.\nAdd images or choose a different wallpaper directory."
                     : root.shellSettingsHint
                 font.pixelSize: 14; color: "#BBBBBB"; horizontalAlignment: Text.AlignHCenter; lineHeight: 1.4
@@ -864,12 +1044,23 @@ Item {
             clip: true
 
             Repeater {
-                model: root._cacheEntries
+                model: root._imageCacheEntries
                 Image {
                     width: carousel.itemWidth; height: carousel.itemHeight
                     asynchronous: true
                     source: modelData
-                    sourceSize: Qt.size(carousel.itemWidth, carousel.itemHeight)
+                    sourceSize: carousel.thumbnailSourceSize
+                    fillMode: Image.PreserveAspectCrop
+                }
+            }
+
+            Repeater {
+                model: root._videoCacheEntries
+                Image {
+                    width: carousel.itemWidth; height: carousel.itemHeight
+                    asynchronous: true
+                    source: modelData
+                    sourceSize: carousel.thumbnailSourceSize
                     fillMode: Image.PreserveAspectCrop
                 }
             }
@@ -900,7 +1091,7 @@ Item {
                             width: carousel.itemWidth; height: carousel.itemHeight
                             asynchronous: true
                             source: fileUrl
-                            sourceSize: Qt.size(carousel.itemWidth, carousel.itemHeight)
+                            sourceSize: carousel.thumbnailSourceSize
                             fillMode: Image.PreserveAspectCrop
                         }
                     }

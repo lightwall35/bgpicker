@@ -58,6 +58,40 @@ send_ipc() {
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 case "${1:-toggle}" in
+    engine)
+        exec "$SCRIPT_DIR/wallpaper_engine.sh" "${2:-status}"
+        ;;
+    video)
+        case "${2:-status}" in
+            status)
+                printf 'engine: %s\nmode: %s\nvideo: %s\n' \
+                    "$(cat "${XDG_STATE_HOME:-$HOME/.local/state}/bgpicker/engine" 2>/dev/null || printf full)" \
+                    "$(cat "${XDG_STATE_HOME:-$HOME/.local/state}/bgpicker/video-mode" 2>/dev/null || printf normal)" \
+                    "$(cat "${XDG_STATE_HOME:-$HOME/.local/state}/bgpicker/video-wallpaper" 2>/dev/null || true)"
+                ;;
+            normal|parallax)
+                [[ $# -le 3 ]] || { echo "Usage: $0 video [status|normal|parallax [file]|next]" >&2; exit 1; }
+                exec "$SCRIPT_DIR/wallpaper_engine.sh" video "$2" "${3:-}"
+                ;;
+            next)
+                shopt -s nullglob
+                files=()
+                for file in "$SCRIPT_DIR"/dynamic/*; do
+                    [[ -f "$file" ]] || continue
+                    case "${file,,}" in *.mp4|*.mkv|*.webm|*.mov) files+=("$file");; esac
+                done
+                ((${#files[@]})) || { echo 'BgPicker: no videos found in dynamic/' >&2; exit 1; }
+                current="$(cat "${XDG_STATE_HOME:-$HOME/.local/state}/bgpicker/video-wallpaper" 2>/dev/null || true)"
+                index=0
+                for i in "${!files[@]}"; do
+                    if [[ "${files[$i]}" == "$current" ]]; then index=$(((i + 1) % ${#files[@]})); break; fi
+                done
+                video_mode="$(cat "${XDG_STATE_HOME:-$HOME/.local/state}/bgpicker/video-mode" 2>/dev/null || printf normal)"
+                exec "$SCRIPT_DIR/wallpaper_engine.sh" video "$video_mode" "${files[$index]}"
+                ;;
+            *) echo "Usage: $0 video [status|normal|parallax [file]|next]" >&2; exit 1 ;;
+        esac
+        ;;
     start)
         start_daemon
         ;;

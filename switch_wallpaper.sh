@@ -5,6 +5,18 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "$(cat "${XDG_STATE_HOME:-$HOME/.local/state}/bgpicker/engine" 2>/dev/null || printf full)" == video ]]; then
+    echo "BgPicker: switch to a static engine before choosing an image" >&2
+    exit 1
+fi
+# The lightweight engine bypasses awww and Quickshell entirely.
+if [[ "$(cat "${XDG_STATE_HOME:-$HOME/.local/state}/bgpicker/engine" 2>/dev/null || printf full)" == simple ]]; then
+    case "${1:-}" in
+        --restore) exec "$SCRIPT_DIR/simple_wallpaper.sh" ;;
+        --mode) echo "BgPicker: mode changes require the full engine" >&2; exit 1 ;;
+        *) exec "$SCRIPT_DIR/simple_wallpaper.sh" "$@" ;;
+    esac
+fi
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/bgpicker"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/bgpicker"
 # Existing compositor startup commands read this path; keep it up to date.
@@ -48,11 +60,13 @@ fi
 ORIGINAL="$(realpath -e -- "$ORIGINAL")"
 SMOOTH_ENTER=false
 SMOOTH_EXIT=false
-if ! $RESTORE && [[ "$MODE" != "$PREVIOUS_MODE" ]]; then
+HANDOFF=false
+[[ "${BGPICKER_HANDOFF:-false}" == true ]] && HANDOFF=true
+if ! $RESTORE && ! $HANDOFF && [[ "$MODE" != "$PREVIOUS_MODE" ]]; then
     if [[ "$MODE" == parallax ]]; then SMOOTH_ENTER=true; else SMOOTH_EXIT=true; fi
 fi
 RESOLVE_ARGS=(--shell)
-$RESTORE && RESOLVE_ARGS+=(--instant)
+if $RESTORE || $HANDOFF; then RESOLVE_ARGS+=(--instant); fi
 # Resolve random once, then give the very same immutable settings to either
 # backend. No shell eval: every validated argument is a separate array entry.
 TRANSITION_DATA="$(python3 "$SCRIPT_DIR/wallpaper_settings.py" resolve "${RESOLVE_ARGS[@]}")"
@@ -133,8 +147,10 @@ if [[ "$BACKDROP_STATE" == started ]]; then
     BACKDROP_STARTED=true
     # Seed the old cached frame first, so the first transition has a source.
     SEED_BLUR="$BLURRED"
-    [[ -f "$PREVIOUS_BLUR" ]] && SEED_BLUR="$PREVIOUS_BLUR"
-    if [[ "$BACKDROP_PARALLAX" != on ]]; then
+    if ! $HANDOFF && [[ -f "$PREVIOUS_BLUR" ]]; then SEED_BLUR="$PREVIOUS_BLUR"; fi
+    if [[ "$BACKDROP_PARALLAX" == on ]]; then
+        XDG_CACHE_HOME="$BACKDROP_CACHE" awww clear --namespace "$BACKDROP_NAMESPACE" 00000000 9>&-
+    else
         XDG_CACHE_HOME="$BACKDROP_CACHE" awww img --namespace "$BACKDROP_NAMESPACE" \
             "$SEED_BLUR" --transition-type none 9>&-
     fi
@@ -259,6 +275,9 @@ else
         awww img "$ORIGINAL" --transition-type none 9>&- || MAIN_RESULT=$?
     else
         awww img "$ORIGINAL" "${TRANSITION_ARGS[@]}" 9>&- || MAIN_RESULT=$?
+        if $HANDOFF && [[ "$MAIN_RESULT" == 0 ]]; then
+            await_awww_image || MAIN_RESULT=$?
+        fi
     fi
     [[ "$MAIN_RESULT" == 0 ]] && MAIN_CHANGED=true
     wait "$BACKDROP_PID" || { echo "BgPicker: backdrop update failed" >&2; exit 1; }

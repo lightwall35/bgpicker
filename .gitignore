@@ -2,3 +2,10 @@
 /wallpapers/*
 !/wallpapers/.gitkeep
 __pycache__/
+
+# Local video wallpapers
+/dynamic/*
+!/dynamic/.gitkeep
+
+# Local conversation log
+/conversation.md

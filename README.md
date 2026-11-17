@@ -1,15 +1,66 @@
 # BgPicker：壁纸选择、模糊背景与可选视差
 
-独立运行的 Quickshell 壁纸工具，适用于 niri。全屏倾斜卡片轮播负责选择图片，模糊背景按需生成并缓存，由独立 awww 实例绘制。
+适用于 niri 的壁纸工具。完整模式使用 Quickshell 选择器、awww 和可选视差；简洁模式使用两个 swaybg 显示清晰壁纸和模糊背景。模糊图按需生成并缓存。
 
 | 模式 | 清晰壁纸 | 模糊背景 |
 | --- | --- | --- |
 | `awww`（默认） | 原有 awww 切换效果，支持 GIF | 默认使用独立 awww 实例，可选视差 |
 | `parallax`（实验） | Quickshell 绘制，跟随焦点窗口列水平移动 | 默认使用独立 awww 实例，可选视差 |
 
+## 视频壁纸与双页面选择器
+
+将 MP4、MKV、WebM 或 MOV 视频放在 `dynamic/`；视频文件不会加入 Git。支持的视频格式取决于本机 Qt Multimedia / FFmpeg。
+
+```bash
+./bgpicker.sh video normal             # 普通视频：清晰前景和动态模糊后景
+./bgpicker.sh video parallax           # Quickshell 视频视差（实验）
+./bgpicker.sh video parallax "/绝对路径/视频.mp4"  # 使用指定视频
+./bgpicker.sh video next               # 按文件名顺序切换 dynamic/ 中的视频
+./bgpicker.sh video                    # 查看当前引擎、视频模式与文件
+./bgpicker.sh engine full              # 恢复完整静态壁纸模式
+./bgpicker.sh engine simple            # 恢复简洁静态壁纸模式
+```
+
+按 `Mod+N`（或 `./bgpicker.sh toggle`）打开面板（界面仅保留选项按钮内的文字，隐藏多余标题与提示）。向下滚动进入动态壁纸页，向上滚动回静态页：旧卡片行沿方向移动并淡出，新行从相反方向进入并淡显；静止时只显示一行。切页不会应用壁纸。两页分别记住选中项，左右键、搜索、点击／Enter 应用沿用原来的操作。动态页的卡片从视频提取 `2560×840` 上限的缩略图，应用时使用原视频；静态与动态缩略图均在 `cacheWindow` 中按 `2560×840` 解码并保持常驻预缓存，两页来回切换无需重新加载。
+
+两页底部的“普通／视差”和七种切换效果按钮均可用；切换效果偏好共用，普通／视差状态各自保存。视频先启动解码与场景图预热（至少 2 帧就绪），首帧准备好后同步前后景时间点并同时播放换图效果，新旧视频在动画期间都继续播放且保持底层可见不透底；效果结束后才释放旧播放器。从视频切回静态壁纸时也会先在同一渲染器中播放同一套换图效果（旧视频在过渡期间继续播放），完成后同步 awww 缓存并无缝交回静态后端。两层使用同一次效果参数，随机效果只选择一次。第一次应用视频可能需要生成模糊缓存，准备期间保持旧壁纸显示。
+
+首次使用未指定视频时选 `dynamic/` 中的第一段；之后记住上次视频和模式，登录时恢复。视频恢复失败时尝试退回简洁静态模式。视频模式保留选择器供 `Mod+N` 随时打开，停止 awww 和静态视差绘制；应用静态卡片会自动交回完整静态模式。极简的 `engine simple` 仍会结束选择器，手动按 `Mod+N` 时可按需打开。`Mod+A` 仍用于静态目录轮换，视频可用面板或 `video next` 切换。`scene.pkg` 和网页壁纸不能直接播放。
+
+普通和视差视频统一通过持久 Quickshell 服务播放，以支持同一套换图效果。每屏前景与模糊后景各自解码，使用静态视差已有的列计算、几何和缓动。首次使用时 FFmpeg 缓存 1920 像素宽、30 fps、CRF 18 的模糊视频；前景保留原始帧率。模糊缓存可删除重建。前后景定期校正播放进度，但两个解码器与合成器调度仍可能产生误差，不保证逐帧同步。换图期间会临时同时解码新旧视频，内存和 GPU 峰值高于稳定播放时。
+
+视频与缩略图需要 Quickshell、Qt Multimedia、FFmpeg 和 Python 3。niri 规则需包含 `namespace="^bgpicker:backdrop$"`，把模糊层放入概览背景。当前已在单屏验证，其他屏幕和编码格式的解码／性能仍需实测。
+
+## 简洁模式
+
+除完整模式外，可以使用两个 swaybg 显示清晰壁纸和概览模糊背景：
+
+```bash
+./bgpicker.sh engine simple  # 切换到简洁模式
+./bgpicker.sh engine full    # 恢复完整模式及之前的普通/视差设置
+./bgpicker.sh engine toggle  # 在两套模式之间切换
+./bgpicker.sh engine         # 查看当前模式
+```
+
+模式会保存并在下次登录时恢复。简洁模式停止本项目的 Quickshell、独立模糊 awww 实例和默认 awww 实例；如果其他程序也在使用默认 awww 实例，它们也会受影响。简洁模式换图直接显示，不播放过渡动画，GIF 以静态图显示；选择器和视差功能需要切回完整模式。清晰和模糊层均由 swaybg 绘制，模糊图片沿用现有缓存。完整模式保留选择器、动画和视差设置。
+
+本机的 `Mod+A` 绑定由 `~/.config/niri/scripts/change_wallpaper.sh` 提供，按 `wallpapers/` 中的文件顺序轮换，两个模式都可使用；这个脚本是本机配置，并未随仓库提供。首次切换简洁模式前需要先在完整模式选择一张壁纸，或通过 `./switch_wallpaper.sh 图片路径` 设置当前壁纸。
+
+本机单屏、同一张壁纸的一次测量中，简洁模式两个 swaybg 合计约 31 MiB RSS、8.5 MiB PSS；完整模式启动约 13 秒后，QS 和两个 awww 合计约 732 MiB RSS、463 MiB PSS。PSS 会分摊共享内存；图片、视差和运行时间会影响结果，这些数字不包含单独测量的 GPU 显存或换图峰值。
+
+由于 swaybg 不提供自定义 layer namespace 的选项，简洁模式从本机 swaybg 二进制生成一份仅改变 namespace 的本地副本，用于区分桌面和概览两层；不会修改系统文件。swaybg 更新后自动重新生成，若二进制格式不符合预期则报错并保留现有画面。简洁模式需要 swaybg、Python 3、ImageMagick、Bash、GNU coreutils 和 util-linux（`flock`）。
+
+自启动需改为下面的模式入口，并移除原先直接启动的两条 `awww-daemon` 和项目 QS 命令：
+
+```kdl
+spawn-at-startup "/home/lightwall/playground/bgpicker/wallpaper_engine.sh" "startup"
+```
+
+niri 仍需对 `namespace="^wallpaper$"` 设置 `place-within-backdrop true`，使模糊层放入概览背景；清晰层使用独立 namespace。
+
 ## 安装与启动
 
-依赖：Quickshell ≥ 0.3.0、awww、ImageMagick 7、Python 3、Bash、GNU coreutils、util-linux（`flock`）。可选安装 `swaybg`，在模糊实例无法启动时临时恢复静态背景。视差模式需要 niri 会话提供 `NIRI_SOCKET`。仓库附带编译后的 Qt 着色器，正常使用不需要安装编译工具。
+完整模式依赖：Quickshell ≥ 0.3.0、awww、ImageMagick 7、Python 3、Bash、GNU coreutils、util-linux（`flock`）。简洁模式需要安装 `swaybg`；完整模式也可以在模糊实例无法启动时使用它临时恢复静态背景。视差模式需要 niri 会话提供 `NIRI_SOCKET`。仓库附带编译后的 Qt 着色器，正常使用不需要安装编译工具。
 
 把原图放进本项目 `wallpapers/`。中文、空格文件名均可；不用预先生成模糊图。个人图片默认被 Git 忽略。在 Wayland 会话终端运行：
 
@@ -18,17 +69,18 @@
 ./bgpicker.sh toggle
 ```
 
-普通模式需要运行 `awww-daemon`。niri 自启动示例（替换成实际安装路径）：
+旧版的直接启动方式仅适用于始终使用完整模式；要使用简洁模式，请改用上面的统一启动入口：
 
 ```kdl
 spawn-at-startup "awww-daemon"
 spawn-at-startup "qs" "-p" "/home/lightwall/playground/bgpicker" "-n" "-d"
 ```
 
-niri 并行启动 Quickshell 和 awww。视差模式换图时同步 awww 的启动缓存；恢复视差时，QS 先准备图片，等待 awww 恢复后再交接。当前仅直接同步已验证的 awww 0.12.1 缓存格式；缓存不匹配时，QS 恢复流程会通过 awww 重新加载当前图。缺失的模糊缓存从原图重建。切换脚本自动启动独立的 `bgpicker-backdrop` awww 实例。为 niri 添加以下规则，让模糊实例显示在概览背景：
+统一启动入口在完整模式下启动 awww 和 Quickshell 并恢复当前壁纸。视差模式换图时同步 awww 的启动缓存；恢复视差时，QS 先准备图片，等待 awww 恢复后再交接。当前仅直接同步已验证的 awww 0.12.1 缓存格式；缓存不匹配时，QS 恢复流程会通过 awww 重新加载当前图。缺失的模糊缓存从原图重建。切换脚本自动启动独立的 `bgpicker-backdrop` awww 实例。为 niri 添加以下规则，让模糊实例显示在概览背景：
 
 ```kdl
 layer-rule {
+    match namespace="^wallpaper$" // 简洁模式的模糊 swaybg
     match namespace="^awww-daemonbgpicker-backdrop$"
     match namespace="^bgpicker:backdrop$"
     place-within-backdrop true
@@ -42,13 +94,14 @@ layer-rule {
 | 操作 | 入口 |
 | --- | --- |
 | 显示／关闭选择器 | `./bgpicker.sh toggle` |
+| 静态／动态页切换 | 鼠标滚轮上／下 |
 | 浏览 | `←` / `→` 或 `H` / `L` |
 | 应用／关闭 | `Enter` / `Escape` |
 | 搜索文件名 | `Ctrl+F` |
 | 首张／末张 | `Home` / `End` |
 | 放大预览 | 停留在卡片上 |
 | 普通／视差模式切换 | 选择器底部中央的倾斜分段选项 |
-| 选择换图效果 | 底部“切换效果”，普通与视差共用；下次应用图片时生效 |
+| 选择换图效果 | 底部右侧的七种切换效果按钮，普通与视差共用；下次应用壁纸时生效 |
 
 ```bash
 ./bgpicker.sh mode                 # 显示已保存的模式
@@ -77,7 +130,7 @@ qs ipc -p <project> call wallpaperCarousel cyclePrevious
 
 开机恢复视差时，也会从 awww 的居中画面平滑交接到 QS 视差位置，使用同一个 `parallax.modeTransitionMs`；设为 `0` 可同时关闭模式切换和开机交接动画。QS 已在显示视差时重新执行恢复不会重复淡入。
 
-模糊背景视差仅通过上面的命令行开关控制，与清晰壁纸的模式独立，默认关闭；开关状态会保存，启动时随壁纸恢复。它使用缓存的模糊图和相同的视差参数与换图效果；同时启用两层视差会增加纹理、图形内存和渲染开销，两层的具体帧时序可能略有差异。启用／关闭使用 `modeTransitionMs` 平滑交接，关闭后恢复独立 awww 模糊背景。需要上方的两条 niri layer 规则，否则模糊视差层不会正确放入概览背景。
+模糊背景视差仅通过上面的命令行开关控制，与清晰壁纸的模式独立，默认关闭；开关状态会保存，启动时随壁纸恢复。它使用缓存的模糊图和相同的视差参数与换图效果；同时启用两层视差会增加纹理、图形内存和渲染开销，两层的具体帧时序可能略有差异。启用／关闭使用 `modeTransitionMs` 平滑交接，关闭后恢复独立 awww 模糊背景。需要上方适用于 awww 和 QS 的 niri layer 规则，否则模糊视差层不会正确放入概览背景。
 
 ## 换图效果（两种模式共用）
 
@@ -169,8 +222,17 @@ cp -n settings.example.json "${XDG_CONFIG_HOME:-$HOME/.config}/bgpicker/settings
 | --- | --- |
 | `wallpapers/` | 本地原图 |
 | `${XDG_STATE_HOME:-~/.local/state}/bgpicker/current_wallpaper` | 上次成功应用的原图 |
-| `${XDG_STATE_HOME:-~/.local/state}/bgpicker/mode` | 模式；不存在时为 `awww` |
+| `${XDG_STATE_HOME:-~/.local/state}/bgpicker/engine` | 完整／简洁／视频模式；不存在时为 `full` |
+| `${XDG_STATE_HOME:-~/.local/state}/bgpicker/video-wallpaper`、`video-mode` | 上次视频及普通／视差模式 |
+| `${XDG_STATE_HOME:-~/.local/state}/bgpicker/video-manager.json` | 视频管理进程的身份和临时 IPC 目录 |
+| `${XDG_STATE_HOME:-~/.local/state}/bgpicker/mode` | 完整模式下的 `awww`／`parallax`；不存在时为 `awww` |
+| `${XDG_STATE_HOME:-~/.local/state}/bgpicker/simple-{front,back}.pid` | 简洁模式实例的 PID 与启动时间，用于安全交接 |
 | `${XDG_STATE_HOME:-~/.local/state}/bgpicker/backdrop_parallax` | 模糊背景视差开关；不存在时为 `off` |
+| `${XDG_CACHE_HOME:-~/.cache}/bgpicker/video-blur/` | 生成的动态模糊视频缓存 |
+| `${XDG_CACHE_HOME:-~/.cache}/bgpicker/video-thumbnails/` | 动态卡片缩略图 |
+| `${XDG_CACHE_HOME:-~/.cache}/bgpicker/video.log` | 视频壁纸日志 |
+| `${XDG_CACHE_HOME:-~/.cache}/bgpicker/swaybg-front` | 清晰层专用 swaybg 副本 |
+| `${XDG_CACHE_HOME:-~/.cache}/bgpicker/simple-swaybg.log` | 简洁模式 swaybg 日志 |
 | `${XDG_CACHE_HOME:-~/.cache}/bgpicker/blur/` | 按原图内容和参数生成的模糊图 |
 | `~/.cache/current_swaybg_img` | 兼容旧自启动配置的模糊图路径 |
 | `${XDG_CACHE_HOME:-~/.cache}/bgpicker/backdrop-awww/` | 模糊实例独立的 awww 缓存，避免与清晰实例争用恢复记录 |
@@ -188,7 +250,7 @@ cp -n settings.example.json "${XDG_CONFIG_HOME:-$HOME/.config}/bgpicker/settings
 ## 开发
 
 ```bash
-bash -n bgpicker.sh prepare_wallpaper.sh switch_wallpaper.sh backdrop_awww.sh backdrop_parallax.sh build_shaders.sh
+bash -n bgpicker.sh picker_action.sh wallpaper_engine.sh simple_wallpaper.sh prepare_wallpaper.sh switch_wallpaper.sh backdrop_awww.sh backdrop_parallax.sh build_shaders.sh
 python3 -m unittest discover -s tests -v
 QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -input tests/qml
 /usr/lib/qt6/bin/qmllint -I /usr/lib/qt6/qml shell.qml BgPicker.qml
@@ -204,7 +266,7 @@ QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -input tests/qml
 
 已在 niri 26.04／Quickshell 0.3.2 的单屏会话验证普通与视差互切、焦点列驱动、桌面时钟层级、启动恢复和加载失败取消。多屏逻辑有隔离测试，尚未在多块实际显示器上验证。
 
-主要文件：`Carousel.qml` 负责轮播，`SkewSelector.qml` 负责底部分段选项，`BgPicker.qml` 连接操作和切换脚本；视差组件负责 niri 状态与背景绘制；`WallpaperTransitions.js` 和 `wallpaper_settings.py` 统一效果参数，`shaders/` 包含过渡着色器；`switch_wallpaper.sh` 负责后端和状态保存，`prepare_wallpaper.sh` 负责模糊缓存。
+主要文件：`wallpaper_engine.sh` 切换和启动完整／简洁／视频模式，`video_wallpaper.py` 管理视频播放与缓存，`video_shell.qml`、`VideoTransitionLayer.qml` 与 `VideoWallpaperSlot.qml` 负责视频播放与换图，`media_catalog.py` 提供动态卡片目录，`picker_action.sh` 连接面板与渲染引擎，`simple_wallpaper.sh` 管理两层 swaybg；`Carousel.qml` 与 `CarouselMedia.js` 负责双页面轮播，`SkewSelector.qml` 负责底部分段选项，`BgPicker.qml` 连接操作和切换脚本；视差组件负责 niri 状态与背景绘制；`WallpaperTransitions.js` 和 `wallpaper_settings.py` 统一效果参数，`shaders/` 包含过渡着色器；`switch_wallpaper.sh` 负责后端和状态保存，`prepare_wallpaper.sh` 负责模糊缓存。近期更新与后续优化计划见 `UPDATES.md`。
 
 ## 来源
 
