@@ -36,6 +36,7 @@ Item {
     property string currentVideo: ""
     property string videoMode: "normal"
     property string engine: "full"
+    property var imageCatalog: []
     property var videoCatalog: []
     property string lastError: ""
     readonly property bool busy: switchProcess.running || preferencesProcess.running || pendingCommand.length > 0
@@ -85,18 +86,17 @@ Item {
     }
     Process {
         id: catalogProcess
-        command: ["python3", root.installDir + "/media_catalog.py"]
+        command: ["python3", root.installDir + "/media_catalog.py", "--bundle", root.wallpaperDir, root.installDir + "/dynamic"]
         stdout: StdioCollector { id: catalogOutput }
         onExited: (code, status) => {
             if (code === 0) {
-                try { root.videoCatalog = JSON.parse(catalogOutput.text); }
-                catch (error) { root.lastError = "视频目录读取失败。"; }
+                try {
+                    const parsed = JSON.parse(catalogOutput.text);
+                    root.imageCatalog = parsed.images || [];
+                    root.videoCatalog = parsed.videos || [];
+                } catch (error) { root.lastError = "媒体目录读取失败。"; }
             }
         }
-    }
-    Timer {
-        interval: 10000; repeat: true; running: carousel.isOpen
-        onTriggered: if (!catalogProcess.running) catalogProcess.running = true
     }
 
     function processNextWallpaper() {
@@ -162,8 +162,11 @@ Item {
         currentWallpaperPath: root.currentWallpaper
         currentVideoPath: root.currentVideo
         videoFolder: root.installDir + "/dynamic"
+        imageCatalog: root.imageCatalog
+        useImageCatalog: true
         videoCatalog: root.videoCatalog
-        onOpened: if (!catalogProcess.running) catalogProcess.running = true
+        onOpened: if ((root.imageCatalog.length === 0 || root.videoCatalog.length === 0) && !catalogProcess.running) catalogProcess.running = true
+        onCatalogRefreshRequested: if (!catalogProcess.running) catalogProcess.running = true
         hasWallpaperConfigured: true
         shellSettingsHint: "Place your wallpapers in:\n" + root.wallpaperDir
         wallpaperMode: carousel.videoPage ? (root.videoMode === "parallax" ? "parallax" : "awww") : root.wallpaperMode

@@ -5,10 +5,8 @@ import hashlib
 import os
 from pathlib import Path
 import signal
-import socket
 import subprocess
 import sys
-import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parent
@@ -58,7 +56,7 @@ def prepare_thumbnail(video):
     """Create a reusable thumbnail for a video carousel card."""
     source = Path(video).resolve(strict=True)
     info = source.stat()
-    key = hashlib.sha256(("bgpicker-video-thumb-v2-2560x840\0" + str(source) + "\0" + str(info.st_size) + "\0" + str(info.st_mtime_ns)).encode()).hexdigest()
+    key = hashlib.sha256(("bgpicker-video-thumb-v3-1280x672\0" + str(source) + "\0" + str(info.st_size) + "\0" + str(info.st_mtime_ns)).encode()).hexdigest()
     directory = CACHE / 'video-thumbnails'
     directory.mkdir(parents=True, exist_ok=True)
     target = directory / (key + '.jpg')
@@ -68,7 +66,7 @@ def prepare_thumbnail(video):
     try:
         result = subprocess.run(['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
                                  '-i', str(source), '-frames:v', '1', '-vf',
-                                 'scale=2560:840:force_original_aspect_ratio=decrease',
+                                 'scale=1280:672:force_original_aspect_ratio=decrease',
                                  '-q:v', '2', str(temporary)],
                                 capture_output=True, text=True, timeout=60)
         if result.returncode or not temporary.is_file() or not temporary.stat().st_size:
@@ -79,16 +77,50 @@ def prepare_thumbnail(video):
         temporary.unlink(missing_ok=True)
 
 
+def prepare_image_thumbnail(image):
+    """Create a reusable card-sized JPG thumbnail for a static wallpaper."""
+    source = Path(image).resolve(strict=True)
+    info = source.stat()
+    key = hashlib.sha256(("bgpicker-image-thumb-v1-1280x672\0" + str(source) + "\0" + str(info.st_size) + "\0" + str(info.st_mtime_ns)).encode()).hexdigest()
+    directory = CACHE / 'image-thumbnails'
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / (key + '.jpg')
+    if target.is_file() and target.stat().st_size:
+        return str(target)
+    temporary = directory / ('.' + key + f'.{os.getpid()}.jpg')
+    try:
+        result = subprocess.run(['magick', '-limit', 'thread', '2', f'{source}[0]',
+                                 '-auto-orient', '-thumbnail', '1280x672>',
+                                 '-quality', '88', '-strip', str(temporary)],
+                                capture_output=True, text=True, timeout=60)
+        if result.returncode or not temporary.is_file() or not temporary.stat().st_size:
+            raise RuntimeError('image thumbnail failed: ' + result.stderr[-500:])
+        os.replace(temporary, target)
+        return str(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def prepare_blur(video):
     """Pre-render a small, blurred video once; avoid a 4K filter every frame."""
+    source_path = Path(video).resolve(strict=True)
+    info = source_path.stat()
+    directory = CACHE / 'video-blur'
+    directory.mkdir(parents=True, exist_ok=True)
+    meta_key = hashlib.sha256(("bgpicker-video-blur-meta-v2\0" + str(source_path) + "\0" + str(info.st_ino) + "\0" + str(info.st_size) + "\0" + str(info.st_mtime_ns)).encode()).hexdigest()
+    meta_file = directory / (meta_key + '.ref')
+    if meta_file.is_file():
+        cached_target = Path(meta_file.read_text(encoding='utf-8').strip())
+        if cached_target.is_file() and cached_target.stat().st_size:
+            return str(cached_target)
     digest = hashlib.sha256(b'bgpicker-video-blur-v2-1920-30fps-sigma30-crf18\0')
     with open(video, 'rb') as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b''):
             digest.update(chunk)
-    directory = CACHE / 'video-blur'
-    directory.mkdir(parents=True, exist_ok=True)
     target = directory / (digest.hexdigest() + '.mp4')
-    if target.is_file() and target.stat().st_size: return str(target)
+    if target.is_file() and target.stat().st_size:
+        atomic(meta_file, str(target))
+        return str(target)
     temporary = directory / ('.' + digest.hexdigest() + f'.{os.getpid()}.mp4')
     try:
         result = subprocess.run(['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
@@ -100,6 +132,7 @@ def prepare_blur(video):
         if result.returncode or not temporary.is_file() or not temporary.stat().st_size:
             raise RuntimeError('blur video preparation failed: ' + result.stderr[-500:])
         os.replace(temporary, target)
+        atomic(meta_file, str(target))
         return str(target)
     finally:
         temporary.unlink(missing_ok=True)
@@ -107,7 +140,6 @@ def prepare_blur(video):
 
 def run_daemon(video, mode, token):
     children = []
-    sockets = []
     directory = RUNTIME / token
     directory.mkdir(parents=True, mode=0o700)
     status = directory / 'status'
@@ -160,12 +192,87 @@ def run_daemon(video, mode, token):
         log.close()
 
 
-def qs_video(*args):
-    result = subprocess.run(['qs', 'ipc', '-p', str(ROOT / 'video_shell.qml'),
+def _qs_call(project_path, *args):
+    result = subprocess.run(['qs', 'ipc', '-p', str(project_path),
                              'call', 'videoParallax', *args], capture_output=True, text=True, timeout=5)
     if result.returncode or result.stdout.strip().startswith('Not ready to accept queries'):
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or 'video renderer IPC failed')
     return result.stdout.strip()
+
+
+def qs_video(*args):
+    return _qs_call(ROOT / 'video_shell.qml', *args)
+
+
+def _drive_video_apply(ipc_fn, status, video, mode):
+    from wallpaper_settings import resolve, read_config
+    blur = prepare_blur(video)
+    if status.get('currentPath') == video:
+        result = ipc_fn('mode', mode)
+        if result.startswith('error:'): raise RuntimeError(result)
+    else:
+        try:
+            result = ipc_fn('stage', video, blur, mode)
+            if result.startswith('error:'): raise RuntimeError(result)
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                result = ipc_fn('ready', video)
+                if result == 'ready': break
+                if result.startswith('error:'): raise RuntimeError(result)
+                time.sleep(.05)
+            else: raise RuntimeError('video first frame timed out')
+            result = ipc_fn('commit', video, json.dumps(resolve(read_config())))
+            if result.startswith('error:'): raise RuntimeError(result)
+        except BaseException:
+            try: ipc_fn('cancel', video)
+            except (OSError, RuntimeError): pass
+            raise
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        current = json.loads(ipc_fn('status'))
+        if not current.get('transitionActive'): break
+        time.sleep(.05)
+    else: raise RuntimeError('video transition timed out')
+    atomic(STATE / 'video-wallpaper', video + '\n')
+    atomic(STATE / 'video-mode', mode + '\n')
+
+
+def _drive_static_handoff(ipc_fn, image, mode):
+    from wallpaper_settings import resolve, read_config
+    blur = prepare_static_blur(image)
+    backdrop_path = STATE / 'backdrop_parallax'
+    backdrop_parallax = 'on' if backdrop_path.exists() and backdrop_path.read_text().strip() == 'on' else 'off'
+    try:
+        result = ipc_fn('stageStatic', image, blur, mode, backdrop_parallax)
+        if result.startswith('error:'):
+            raise RuntimeError(result)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            result = ipc_fn('readyStatic', image)
+            if result == 'ready':
+                break
+            if result.startswith('error:'):
+                raise RuntimeError(result)
+            time.sleep(.05)
+        else:
+            raise RuntimeError('static image load timed out')
+        result = ipc_fn('commitStatic', image, json.dumps(resolve(read_config())))
+        if result.startswith('error:'):
+            raise RuntimeError(result)
+    except BaseException:
+        try:
+            ipc_fn('cancelStatic', image)
+        except (OSError, RuntimeError):
+            pass
+        raise
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        status = json.loads(ipc_fn('status'))
+        if not status.get('transitionActive'):
+            break
+        time.sleep(.05)
+    else:
+        raise RuntimeError('static transition timed out')
 
 
 def reuse_renderer(video, mode):
@@ -176,36 +283,7 @@ def reuse_renderer(video, mode):
         if status.get('apiVersion') != 2: return False
     except (OSError, RuntimeError, ValueError, KeyError):
         return False
-    from wallpaper_settings import resolve, read_config
-    blur = prepare_blur(video)
-    if status.get('currentPath') == video:
-        result = qs_video('mode', mode)
-        if result.startswith('error:'): raise RuntimeError(result)
-    else:
-        try:
-            result = qs_video('stage', video, blur, mode)
-            if result.startswith('error:'): raise RuntimeError(result)
-            deadline = time.monotonic() + 30
-            while time.monotonic() < deadline:
-                result = qs_video('ready', video)
-                if result == 'ready': break
-                if result.startswith('error:'): raise RuntimeError(result)
-                time.sleep(.05)
-            else: raise RuntimeError('video first frame timed out')
-            result = qs_video('commit', video, json.dumps(resolve(read_config())))
-            if result.startswith('error:'): raise RuntimeError(result)
-        except BaseException:
-            try: qs_video('cancel', video)
-            except (OSError, RuntimeError): pass
-            raise
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        status = json.loads(qs_video('status'))
-        if not status.get('transitionActive'): break
-        time.sleep(.05)
-    else: raise RuntimeError('video transition timed out')
-    atomic(STATE / 'video-wallpaper', video + '\n')
-    atomic(STATE / 'video-mode', mode + '\n')
+    _drive_video_apply(qs_video, status, video, mode)
     return True
 
 
@@ -236,41 +314,7 @@ def transition_to_static(image, mode):
             return False
     except (OSError, RuntimeError, ValueError, KeyError):
         return False
-    from wallpaper_settings import resolve, read_config
-    blur = prepare_static_blur(image)
-    backdrop_path = STATE / 'backdrop_parallax'
-    backdrop_parallax = 'on' if backdrop_path.exists() and backdrop_path.read_text().strip() == 'on' else 'off'
-    try:
-        result = qs_video('stageStatic', image, blur, mode, backdrop_parallax)
-        if result.startswith('error:'):
-            raise RuntimeError(result)
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            result = qs_video('readyStatic', image)
-            if result == 'ready':
-                break
-            if result.startswith('error:'):
-                raise RuntimeError(result)
-            time.sleep(.05)
-        else:
-            raise RuntimeError('static image load timed out')
-        result = qs_video('commitStatic', image, json.dumps(resolve(read_config())))
-        if result.startswith('error:'):
-            raise RuntimeError(result)
-    except BaseException:
-        try:
-            qs_video('cancelStatic', image)
-        except (OSError, RuntimeError):
-            pass
-        raise
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        status = json.loads(qs_video('status'))
-        if not status.get('transitionActive'):
-            break
-        time.sleep(.05)
-    else:
-        raise RuntimeError('static transition timed out')
+    _drive_static_handoff(qs_video, image, mode)
     return True
 
 
@@ -286,13 +330,13 @@ def apply(video, mode):
     p = subprocess.Popen([sys.executable, __file__, '_run', video, mode, token],
                          stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True, close_fds=True)
     log.close()
-    status = RUNTIME / token / 'status'
+    status_file = RUNTIME / token / 'status'
     deadline = time.monotonic() + 1840
     announced = False
     try:
         while time.monotonic() < deadline:
-            if status.exists():
-                result = status.read_text().strip()
+            if status_file.exists():
+                result = status_file.read_text().strip()
                 if result == 'ready': break
                 if result.startswith('error:'): raise RuntimeError(result)
                 if result == 'preparing' and not announced:

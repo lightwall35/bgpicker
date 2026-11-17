@@ -18,6 +18,19 @@ fi
 
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/bgpicker/blur"
 mkdir -p -- "$CACHE_DIR"
+# Fast metadata index avoids re-reading tens of MiB on every wallpaper switch.
+META_INFO="$(stat -c '%n|%i|%s|%Y|%y' -- "$ORIGINAL")"
+META_KEY="$(printf '%s\0%s\0%s\0%s' 'blur-meta-v1' "$META_INFO" "$BLUR_SIZE" "$BLUR_SIGMA" | sha256sum)"
+META_KEY="${META_KEY%% *}"
+META_REF="$CACHE_DIR/$META_KEY.ref"
+if [[ -r "$META_REF" ]]; then
+    CACHED_BLUR="$(cat -- "$META_REF" 2>/dev/null || true)"
+    if [[ -n "$CACHED_BLUR" && -s "$CACHED_BLUR" ]]; then
+        printf '%s\n' "$CACHED_BLUR"
+        exit 0
+    fi
+fi
+
 # Content and processing settings identify a variant, independently of filenames.
 SOURCE_HASH="$(sha256sum < "$ORIGINAL")"
 SOURCE_HASH="${SOURCE_HASH%% *}"
@@ -36,4 +49,7 @@ if [[ ! -s "$BLURRED" ]]; then
     [[ -s "$TEMP_IMAGE" ]]
     mv -f -- "$TEMP_IMAGE" "$BLURRED"
 fi
+META_TMP="$(mktemp "$CACHE_DIR/.meta-XXXXXXXX")"
+printf '%s\n' "$BLURRED" > "$META_TMP"
+mv -f -- "$META_TMP" "$META_REF"
 printf '%s\n' "$BLURRED"

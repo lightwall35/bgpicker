@@ -8,6 +8,7 @@ Item {
     property bool decoded: false
     property int frameCount: 0
     property string failure: ""
+    property bool trackFrames: true
     readonly property bool ready: decoded && frameCount >= 2 && player.hasVideo && player.error === MediaPlayer.NoError
     readonly property bool playing: player.playing
     readonly property int position: player.position
@@ -30,6 +31,7 @@ Item {
         fillMode: VideoOutput.Stretch
         Connections {
             target: output.videoSink
+            enabled: !slot.ready || slot.trackFrames
             function onVideoFrameChanged(frame) {
                 if (output.sourceRect.width > 0 && player.hasVideo) {
                     slot.decoded = true;

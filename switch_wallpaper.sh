@@ -142,19 +142,34 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-BACKDROP_STATE="$(bash "$SCRIPT_DIR/backdrop_awww.sh")"
-if [[ "$BACKDROP_STATE" == started ]]; then
-    BACKDROP_STARTED=true
-    # Seed the old cached frame first, so the first transition has a source.
-    SEED_BLUR="$BLURRED"
-    if ! $HANDOFF && [[ -f "$PREVIOUS_BLUR" ]]; then SEED_BLUR="$PREVIOUS_BLUR"; fi
-    if [[ "$BACKDROP_PARALLAX" == on ]]; then
-        XDG_CACHE_HOME="$BACKDROP_CACHE" awww clear --namespace "$BACKDROP_NAMESPACE" 00000000 9>&-
-    else
-        XDG_CACHE_HOME="$BACKDROP_CACHE" awww img --namespace "$BACKDROP_NAMESPACE" \
-            "$SEED_BLUR" --transition-type none 9>&-
+awww_live() {
+    local ns="${1:-}"
+    if [[ -n "${XDG_RUNTIME_DIR:-}" && -n "${WAYLAND_DISPLAY:-}" && "$(command -v awww 2>/dev/null)" == /usr/* ]]; then
+        [[ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY-awww-daemon${ns:+.$ns}.sock" ]] || return 1
     fi
-    BACKDROP_SEEDED=true
+    if [[ -n "$ns" ]]; then
+        XDG_CACHE_HOME="$BACKDROP_CACHE" awww query --namespace "$ns" 9>&- >/dev/null 2>&1
+    else
+        awww query 9>&- >/dev/null 2>&1
+    fi
+}
+
+BACKDROP_STATE=absent
+if [[ "$BACKDROP_PARALLAX" != on ]] || awww_live "$BACKDROP_NAMESPACE"; then
+    BACKDROP_STATE="$(bash "$SCRIPT_DIR/backdrop_awww.sh")"
+    if [[ "$BACKDROP_STATE" == started ]]; then
+        BACKDROP_STARTED=true
+        # Seed the old cached frame first, so the first transition has a source.
+        SEED_BLUR="$BLURRED"
+        if ! $HANDOFF && [[ -f "$PREVIOUS_BLUR" ]]; then SEED_BLUR="$PREVIOUS_BLUR"; fi
+        if [[ "$BACKDROP_PARALLAX" == on ]]; then
+            XDG_CACHE_HOME="$BACKDROP_CACHE" awww clear --namespace "$BACKDROP_NAMESPACE" 00000000 9>&-
+        else
+            XDG_CACHE_HOME="$BACKDROP_CACHE" awww img --namespace "$BACKDROP_NAMESPACE" \
+                "$SEED_BLUR" --transition-type none 9>&-
+        fi
+        BACKDROP_SEEDED=true
+    fi
 fi
 
 apply_backdrop() {
@@ -182,6 +197,23 @@ await_mode_transition() {
         sleep 0.05
     done
     echo "BgPicker: mode transition timed out" >&2
+    return 1
+}
+
+ensure_awww_daemon() {
+    if awww_live; then return 0; fi
+    setsid awww-daemon --no-cache 9>&- </dev/null >>"$CACHE_DIR/awww.log" 2>&1 &
+    local daemon_pid=$!
+    for ((attempt=0; attempt<50; attempt++)); do
+        if awww query 9>&- >/dev/null 2>&1; then
+            disown "$daemon_pid" 2>/dev/null || true
+            return 0
+        fi
+        kill -0 "$daemon_pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill "$daemon_pid" 2>/dev/null || true
+    echo 'BgPicker: awww-daemon could not start' >&2
     return 1
 }
 
@@ -239,9 +271,11 @@ if [[ "$MODE" == parallax ]]; then
         STATUS="$(backend status)" || { echo 'BgPicker: could not inspect the renderer state' >&2; exit 1; }
         ACTIVE="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); v=d.get("active"); assert isinstance(v,bool); print("true" if v else "false")' "$STATUS")" || { echo 'BgPicker: invalid renderer state' >&2; exit 1; }
         if [[ "$ACTIVE" == false ]]; then
-            await_awww_startup
-            COLD_RESTORE=true
-            SMOOTH_ENTER=true
+            if awww_live; then
+                await_awww_startup
+                COLD_RESTORE=true
+                SMOOTH_ENTER=true
+            fi
         fi
     fi
     if $SMOOTH_ENTER; then
@@ -256,7 +290,7 @@ if [[ "$MODE" == parallax ]]; then
     wait "$BACKDROP_PID" || { echo "BgPicker: backdrop update failed" >&2; exit 1; }
     [[ "$RESULT" == ready ]] || { echo "BgPicker: $RESULT" >&2; exit 1; }
     if $SMOOTH_ENTER; then await_mode_transition; fi
-    if awww query 9>&- >/dev/null 2>&1; then
+    if awww_live; then
         # IPC commit only schedules the first frame. Give Qt and the compositor
         # a brief opportunity to display it before removing the fallback.
         sleep 0.1
@@ -265,6 +299,7 @@ if [[ "$MODE" == parallax ]]; then
     fi
     STAGED=false
 else
+    ensure_awww_daemon
     BACKDROP_TOUCHED=true
     apply_backdrop &
     BACKDROP_PID=$!
@@ -312,6 +347,7 @@ SWITCH_COMPLETED=true
 # cache must not undo a successful wallpaper switch; startup has a fallback.
 if [[ "$MODE" == parallax ]]; then
     python3 "$SCRIPT_DIR/sync_awww_cache.py" "$ORIGINAL" 9>&- || true
+    if awww_live; then awww kill 9>&- >/dev/null 2>&1 || true; fi
 fi
 if [[ -n "$PREVIOUS_BLUR" ]]; then
     while IFS= read -r pid; do

@@ -90,3 +90,55 @@
 5. **元数据缓存键与事件驱动目录刷新**
    - 用 `realpath + size + mtime_ns` 替代 `prepare_wallpaper.sh` 和 `video_wallpaper.py prepare_blur` 每次切换时读取数十 MiB 原文件计算全量 `sha256sum` 的开销。
    - 用 QML `FolderListModel` 监听 `dynamic/` 变动替代 `BgPicker.qml` 中面板打开时每 10 秒拉起一次 `python3 media_catalog.py` 子进程的轮询定时器。
+
+---
+
+## 四、`beta` 分支已落地优化与 A/B 基准对比（2026-11-18）
+
+在 `beta` 分支上完成了上述优化的逐项实现、真实桌面压测调优与回归验证：
+
+### 1. 已实施关键改动
+
+1. **静态与视频双端磁盘缩略图缓存（`1280×672`）**
+   - `video_wallpaper.py` 新增 `prepare_image_thumbnail()`（`magick -thumbnail 1280x672> -quality 88 -strip` 生成磁盘 JPG 缩略图至 `~/.cache/bgpicker/image-thumbnails/`），并将 `prepare_thumbnail()` 收敛至同样匹配的 `1280×672`（`bgpicker-video-thumb-v3-1280x672`）。
+   - `media_catalog.py` 新增 `IMAGE_SUFFIXES`、`build_image_catalog()`（4 线程并发生成）及 `--bundle IMAGE_DIR VIDEO_DIR` 一次打包输出静态与动态目录。
+   - `Carousel.qml` 通过 `imageCatalog` 加载磁盘缩略图并设定 `thumbnailSourceSize: Qt.size(1280, Math.ceil(carousel.itemHeight * 1.6))`，避免直接全量解压 `wallpapers/` 内 10～30 MiB PNG；长按 1.5 秒 `hiResImage` 按需加载原图且设 `cache: false`。
+2. **面板关闭释放离屏 FBO 与收敛 `cacheBuffer`**
+   - `Carousel.qml` 的 3 层卡片 `layer.enabled` 统一绑定 `overlay.visible && ...`，`listView.cacheBuffer` 设为 `overlay.visible ? 1200 : 0`。
+3. **动态壁纸稳态零帧信号与防卡顿隔离架构**
+   - `VideoWallpaperSlot.qml` 为 `videoSink` 连接增加 `trackFrames`，在 `VideoTransitionLayer.qml` 仅于 `transitionActive || stagedPath !== ""` 期间开启帧计数，稳态播放期逐帧 JS 信号降为 0/s。
+   - 经单进程合并实测对比后，发现将 QtMultimedia/FFmpeg 并入主 `shell.qml` 会导致解码器与 CUDA 初始化阻塞 `Carousel` GUI 线程，且退出视频模式后 FFmpeg/CUDA 堆留存约 370 MiB 难以归还系统（`892 MiB PSS` vs 独立进程方案的 `492 MiB PSS`）。因此架构上将视频渲染逻辑抽离为可复用的 `VideoBackend.qml` 与 `VideoWallpaper.qml`，保持 `video_shell.qml` 按需在独立 `qs` 进程中运行，从而实现 0 代码重复、零面板线程阻塞与退出即全额释放内存；同时 `Carousel.qml` 的 `confirmPick()` 将 `wallpaperPicked` 延后至 300ms 确认动画结束关闭遮罩后触发。
+4. **共享 `NiriState`、事件驱动刷新与元信息索引**
+   - `WallpaperBackend.qml` 与 `shell.qml` 共用顶层单一 `NiriState` 实例订阅 `NIRI_SOCKET`。
+   - `BgPicker.qml` 移除 10 秒轮询 `Timer`，改由 `Carousel.qml` 的 `FolderListModel` 监听 `dynamic/` 自动触发 `catalogRefreshRequested`。
+   - `prepare_wallpaper.sh`（`blur-meta-v1`）与 `video_wallpaper.py prepare_blur()`（`bgpicker-video-blur-meta-v2`）均引入 `.ref` 元数据索引，命中缓存时跳过全文件 SHA-256 哈希读取。
+5. **全视差按需停用闲置 `awww-daemon` 与 UNIX 套接字直检**
+   - `switch_wallpaper.sh`、`backdrop_parallax.sh` 与 `wallpaper_engine.sh` 在进入静态全视差或视频模式后自动清理闲置的前景与 `bgpicker-backdrop` 守护进程，切回 `awww` 或关闭模糊视差时再按需拉起；并新增 `awww_live` / `awww_backdrop_live` 直接检查 `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY-awww-daemon*.sock`，消除进程未运行时调用 `awww query`/`kill` 触发的每次约 507ms 超时重试，同时修复了无 `awww-daemon` 时 `--restore` 阻塞报错的边界问题。
+
+### 2. 旧版（`4137fc8`）vs `beta` 全量性能与卡顿基准对比
+
+测试环境：`eDP-2` 2560×1600 @ 165Hz（理想单帧 6.06 ms），`engine=full`、`mode=parallax`、`backdrop_parallax=on`，隔离对比副本挂载同一媒体目录并使用相同 `FrameAnimation` 探针：
+
+| 指标 | 旧版 (`4137fc8`) | `beta` 版 | 变化 |
+| --- | ---: | ---: | --- |
+| 静态全视差常驻内存 (`qs` + `awww`) | 1184.2 RSS / **930.6 PSS** (3 进程) | 711.0 RSS / **477.5 PSS** (1 进程) | **-453.1 MiB (-48.7%)** |
+| 视频全视差运行内存 (`柠檬_1.mp4`) | 2433.2 RSS / **1900.4 PSS** (3 进程) | 2017.7 RSS / **1485.0 PSS** (3 进程) | **-415.4 MiB (-21.9%)** |
+| 视频切回静态后常驻内存 | 1241.4 RSS / **961.8 PSS** (3 进程) | 751.6 RSS / **492.0 PSS** (1 进程) | **-469.8 MiB (-48.8%)** |
+| 视频稳态播放 CPU 占用（2s 采样） | 41.21% | **34.76%** | **-6.45 个百分点 (-15.7%)** |
+| `prepare_wallpaper.sh` 命中 (`Q.png` 30.3 MiB) | 27.1 ms | **9.8 ms** | **-63.8%** |
+| `video_wallpaper.py prepare_blur` 命中 (`柠檬_1.mp4`) | 55.8 ms | **23.8 ms** | **-57.3%** |
+| 冷启动并恢复 (`startup_restore`) | 3094.5 ms | **1408.4 ms** | **-54.5%** |
+| 静态切静态 (`HW2S -> Q.png`) | 779.8 ms | 922.3 ms（含 300ms 确认动画延后） | 实际后端 ~622 ms |
+| 静态切视频 (`static -> video1`) | 3430.1 ms | **2851.4 ms** | **-16.9%** |
+| 视频切视频 (`video1 -> video2`) | 2540.5 ms | **1931.7 ms** | **-24.0%** |
+| 视频切回静态 (`video2 -> static`) | 3201.6 ms | **2184.5 ms** | **-31.8%** |
+| 4 组卡片点选确认动画卡顿帧 (`>16.7ms`) | 0 帧 | **0 帧** (p50 5.99~6.05 ms) | 锁死 165Hz |
+| 静切视频期后台最大单帧耗时 | 62.73 ms (1 帧 >50ms) | **39.94 ms** (**0 帧 >50ms**) | 峰值显著收敛 |
+| 视频播放期开面板滚动 p99 / max | 8.00 ms / 78.69 ms | **6.97 ms / 67.88 ms** | p99 与尖峰同步下降 |
+
+### 3. 回归验证状态
+
+- Shell 语法检查（全部 `.sh` 脚本 `bash -n`）：退出码 0。
+- Python 单元测试（`python3 -m unittest discover -s tests -q`）：57 项全部通过。
+- 离线 QML 测试（`qmltestrunner -input tests/qml`）：21 项全部通过。
+- `qmllint` 检查全部修改及新增 QML 文件：退出码 0。

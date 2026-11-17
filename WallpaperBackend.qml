@@ -16,8 +16,10 @@ Item {
     property var settings: WallpaperMath.settings({})
     property var transition: Transitions.settings({})
     property var lastTransition: ({})
-    readonly property bool niriConnected: niri.connected
-    readonly property var niriState: niri.snapshot
+    property var sharedNiri: null
+    readonly property var activeNiri: root.sharedNiri ? root.sharedNiri : localNiri
+    readonly property bool niriConnected: activeNiri.connected
+    readonly property var niriState: activeNiri.snapshot
     readonly property string settingsPath: (Quickshell.env("XDG_CONFIG_HOME")
         || Quickshell.env("HOME") + "/.config") + "/bgpicker/settings.json"
 
@@ -36,7 +38,7 @@ Item {
     }
 
     function stage(path) {
-        if (niri.socketPath === "") return "error: NIRI_SOCKET is missing";
+        if (activeNiri.socketPath === "") return "error: NIRI_SOCKET is missing";
         if (!path.startsWith("/")) return "error: an absolute image path is required";
         stagedPath = path;
         resourcesEnabled = true;
@@ -106,7 +108,7 @@ Item {
 
     function reloadSettings() { preferencesFile.reload(); }
 
-    NiriState { id: niri; subscribed: root.resourcesEnabled }
+    NiriState { id: localNiri; subscribed: root.resourcesEnabled && !root.sharedNiri }
 
     FileView {
         id: preferencesFile

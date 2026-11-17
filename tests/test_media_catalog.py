@@ -70,6 +70,33 @@ class MediaCatalogTests(unittest.TestCase):
         self.assertEqual(json.loads(output.getvalue()), [entry])
         self.assertIn('decode failed', errors.getvalue())
 
+    def test_image_catalog_and_bundle_cli_include_both_media_sets(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            img_dir = root / 'images'
+            vid_dir = root / 'videos'
+            img_dir.mkdir(); vid_dir.mkdir()
+            (img_dir / 'b.png').write_bytes(b'png')
+            (img_dir / 'A.jpg').write_bytes(b'jpg')
+            (img_dir / 'ignore.mp4').write_bytes(b'mp4')
+            (vid_dir / 'clip.mp4').write_bytes(b'mp4')
+            img_thumb = root / 'img_thumb.jpg'
+            vid_thumb = root / 'vid_thumb.jpg'
+            output, errors = io.StringIO(), io.StringIO()
+            with patch.object(catalog, 'prepare_image_thumbnail', return_value=str(img_thumb)) as ithumbs, \
+                 patch.object(catalog, 'prepare_thumbnail', return_value=str(vid_thumb)) as vthumbs, \
+                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                result = catalog.main(['--bundle', str(img_dir), str(vid_dir)])
+            self.assertEqual(result, 0)
+            self.assertEqual(ithumbs.call_count, 2)
+            self.assertEqual(vthumbs.call_count, 1)
+            payload = json.loads(output.getvalue())
+            self.assertEqual([e['fileName'] for e in payload['images']], ['A.jpg', 'b.png'])
+            self.assertEqual([e['fileName'] for e in payload['videos']], ['clip.mp4'])
+            self.assertEqual(payload['images'][0]['thumbnailUrl'], img_thumb.as_uri())
+            self.assertEqual(payload['videos'][0]['thumbnailUrl'], vid_thumb.as_uri())
+            self.assertEqual(errors.getvalue(), '')
+
 
 if __name__ == '__main__':
     unittest.main()

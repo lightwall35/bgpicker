@@ -23,6 +23,17 @@ save_engine() {
     printf '%s\n' "$1" > "$STATE/engine.tmp.$$"
     mv -f "$STATE/engine.tmp.$$" "$STATE/engine"
 }
+awww_live() {
+    local ns="${1:-}"
+    if [[ -n "${XDG_RUNTIME_DIR:-}" && -n "${WAYLAND_DISPLAY:-}" && "$(command -v awww 2>/dev/null)" == /usr/* ]]; then
+        [[ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY-awww-daemon${ns:+.$ns}.sock" ]] || return 1
+    fi
+    if [[ -n "$ns" ]]; then
+        XDG_CACHE_HOME="$CACHE/backdrop-awww" awww query --namespace "$ns" >/dev/null 2>&1
+    else
+        awww query >/dev/null 2>&1
+    fi
+}
 if [[ "$request" == video ]]; then
     video_mode="${2:-$(cat "$STATE/video-mode" 2>/dev/null || printf normal)}"
     video_path="${3:-$(cat "$STATE/video-wallpaper" 2>/dev/null || true)}"
@@ -44,8 +55,8 @@ if [[ "$request" == video ]]; then
     for target in wallpaperBackend backdropBackend; do
         qs ipc -p "$DIR" call "$target" deactivate >/dev/null 2>&1 || true
     done
-    XDG_CACHE_HOME="$CACHE/backdrop-awww" awww kill --namespace bgpicker-backdrop >/dev/null 2>&1 || true
-    awww kill >/dev/null 2>&1 || true
+    if awww_live bgpicker-backdrop; then XDG_CACHE_HOME="$CACHE/backdrop-awww" awww kill --namespace bgpicker-backdrop >/dev/null 2>&1 || true; fi
+    if awww_live; then awww kill >/dev/null 2>&1 || true; fi
     "$DIR/simple_wallpaper.sh" --stop
     save_engine video
     "$DIR/bgpicker.sh" start 8>&-
@@ -53,8 +64,8 @@ elif [[ "$request" == simple ]]; then
     "$DIR/simple_wallpaper.sh" 8>&-
     # Stop only this project's shell and its dedicated backdrop instance.
     "$DIR/bgpicker.sh" stop
-    XDG_CACHE_HOME="$CACHE/backdrop-awww" awww kill --namespace bgpicker-backdrop >/dev/null 2>&1 || true
-    awww kill >/dev/null 2>&1 || true
+    if awww_live bgpicker-backdrop; then XDG_CACHE_HOME="$CACHE/backdrop-awww" awww kill --namespace bgpicker-backdrop >/dev/null 2>&1 || true; fi
+    if awww_live; then awww kill >/dev/null 2>&1 || true; fi
     save_engine simple
     python3 "$DIR/video_wallpaper.py" stop 8>&-
 else
@@ -76,7 +87,11 @@ else
     if $handoff; then
         python3 "$DIR/sync_awww_cache.py" "$target_image" 8>&- 2>/dev/null || true
     fi
-    if ! awww query >/dev/null 2>&1; then
+    need_awww=false
+    if [[ "$target_mode" == awww ]] || { ! $handoff && $is_startup; }; then
+        need_awww=true
+    fi
+    if $need_awww && ! awww_live; then
         daemon_args=()
         if $handoff && [[ "$target_mode" == parallax ]]; then
             daemon_args=(--no-cache)
@@ -87,13 +102,13 @@ else
             sleep 0.1
         done
     fi
-    if $handoff && [[ "$target_mode" == parallax ]]; then
+    if $handoff && [[ "$target_mode" == parallax ]] && awww_live; then
         awww clear 00000000 8>&- >/dev/null 2>&1 || true
     fi
     apply_args=(--restore)
     [[ -z "${2:-}" ]] || apply_args=("$2")
     [[ -z "${3:-}" ]] || apply_args=(--mode "$3" "$2")
-    if ! awww query >/dev/null 2>&1 || ! "$DIR/bgpicker.sh" start 8>&- || ! BGPICKER_HANDOFF="$handoff" "$DIR/switch_wallpaper.sh" "${apply_args[@]}" 8>&-; then
+    if { [[ "$target_mode" == awww ]] && ! awww_live; } || ! "$DIR/bgpicker.sh" start 8>&- || ! BGPICKER_HANDOFF="$handoff" "$DIR/switch_wallpaper.sh" "${apply_args[@]}" 8>&-; then
         save_engine "$current"
         if [[ "$current" != full ]]; then
             "$DIR/bgpicker.sh" stop || true

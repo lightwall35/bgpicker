@@ -14,6 +14,12 @@ if [[ "${BGPICKER_LOCK_HELD:-0}" != 1 ]]; then
 fi
 backend() { timeout 3 qs ipc -p "$DIR" call backdropBackend "$@" 9>&-; }
 awww_backdrop() { XDG_CACHE_HOME="$BACKDROP_CACHE" awww "$@" --namespace "$NAMESPACE" 9>&-; }
+awww_backdrop_live() {
+    if [[ -n "${XDG_RUNTIME_DIR:-}" && -n "${WAYLAND_DISPLAY:-}" && "$(command -v awww 2>/dev/null)" == /usr/* ]]; then
+        [[ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY-awww-daemon.$NAMESPACE.sock" ]] || return 1
+    fi
+    awww_backdrop query >/dev/null 2>&1
+}
 current="$(cat "$STATE/backdrop_parallax" 2>/dev/null || printf off)"
 command="${1:-}"
 [[ "$command" != toggle ]] || { if [[ "$current" == on ]]; then command=off; else command=on; fi; }
@@ -28,9 +34,11 @@ fi
 image="$(realpath -e -- "$image")"
 transition='{"type":"none","durationMs":0}'
 if [[ -n "${3:-}" ]]; then transition="$3"; fi
-# An existing awww surface is retained as a fallback and as the base of
-# enable/disable transitions. Never affect the normal wallpaper daemon.
-bash "$DIR/backdrop_awww.sh" >/dev/null
+# An existing awww surface is retained as the base of enable/disable transitions.
+# When backdrop parallax stays active, avoid keeping an idle daemon running.
+if [[ "$command" == on || "$command" == off ]] || awww_backdrop_live; then
+    bash "$DIR/backdrop_awww.sh" >/dev/null
+fi
 wait_mode() {
     local result
     for ((i=0; i<120; i++)); do
@@ -78,10 +86,13 @@ else
             exit 1
         fi
     fi
-    if ! awww_backdrop clear 00000000; then
-        awww_backdrop img "$image" --transition-type none >/dev/null 2>&1 || true
-        backend deactivate >/dev/null 2>&1 || true
-        exit 1
+    if awww_backdrop_live; then
+        if ! awww_backdrop clear 00000000; then
+            awww_backdrop img "$image" --transition-type none >/dev/null 2>&1 || true
+            backend deactivate >/dev/null 2>&1 || true
+            exit 1
+        fi
+        awww_backdrop kill >/dev/null 2>&1 || true
     fi
 fi
 if [[ "$command" != apply ]]; then

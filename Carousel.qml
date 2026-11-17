@@ -26,6 +26,8 @@ Item {
     property string wallpaperTransition: "fade"
     property var wallpaperTransitionChoices: []
     property string wallpaperError: ""
+    property var imageCatalog: []
+    property bool useImageCatalog: false
     property var videoCatalog: []
     property string currentVideoPath: ""
     property string videoFolder: ""
@@ -39,12 +41,16 @@ Item {
     property string _modelPage: "images"
     property var _pageGrab: null
     property var _pageSelections: ({images: "", videos: ""})
-    readonly property int activeEntryCount: videoPage ? videoCatalog.length : folderModel.count
+    readonly property int activeEntryCount: videoPage ? videoCatalog.length : (useImageCatalog ? imageCatalog.length : folderModel.count)
     readonly property string activeCurrentPath: videoPage ? currentVideoPath : currentWallpaperPath
-    readonly property var activeEntries: videoPage ? Media.videos(videoCatalog) : (_folderCache[wallpaperFolder] || [])
+    readonly property var activeEntries: videoPage ? Media.videos(videoCatalog) : (useImageCatalog ? Media.videos(imageCatalog) : (_folderCache[wallpaperFolder] || []))
     readonly property var _pageGeometry: Media.pageGeometry(_pageProgress, _pageDirection, 180)
     property bool _modelSyncPending: false
     property int _pageGeneration: 0
+    onImageCatalogChanged: {
+        if (!videoPage) _syncActiveModel();
+        root._rebuildCacheEntries();
+    }
     onVideoCatalogChanged: {
         if (videoPage) _syncActiveModel();
         root._rebuildCacheEntries();
@@ -65,6 +71,7 @@ Item {
 
     readonly property bool isOpen: overlay.visible
     signal opened()
+    signal catalogRefreshRequested()
     signal wallpaperPicked(string fullPath, string screenName)
     signal wallpaperModeToggleRequested()
     signal wallpaperTransitionSelected(string type)
@@ -128,14 +135,26 @@ Item {
 
         onStatusChanged: {
             if (status === FolderListModel.Ready && !root._initialSyncDone) {
-                root._syncStableModel();
+                if (!root.useImageCatalog) root._syncStableModel();
                 root._initialSyncDone = true;
             }
         }
         onCountChanged: {
-            if (root._initialSyncDone)
-                modelSyncTimer.restart();
+            if (root._initialSyncDone) {
+                if (root.useImageCatalog) root.catalogRefreshRequested();
+                else modelSyncTimer.restart();
+            }
         }
+    }
+
+    FolderListModel {
+        id: videoFolderModel
+        folder: root.videoFolder !== "" ? "file://" + root.videoFolder : ""
+        nameFilters: ["*.mp4", "*.mkv", "*.webm", "*.mov"]
+        showDirs: false
+        property bool _initialVideoSyncDone: false
+        onStatusChanged: if (status === FolderListModel.Ready) _initialVideoSyncDone = true
+        onCountChanged: if (_initialVideoSyncDone) root.catalogRefreshRequested()
     }
 
     function _readFolderModel(model) {
@@ -152,7 +171,8 @@ Item {
     function _entriesForCurrentPage() {
         // Read the source properties directly: a property-changed handler can
         // run before QML has invalidated another binding derived from it.
-        return root.videoPage ? Media.videos(root.videoCatalog) : (root._folderCache[root.wallpaperFolder] || []);
+        return root.videoPage ? Media.videos(root.videoCatalog)
+            : (root.useImageCatalog ? Media.videos(root.imageCatalog) : (root._folderCache[root.wallpaperFolder] || []));
     }
 
     function _findCurrentIndex() {
@@ -185,7 +205,8 @@ Item {
     }
 
     function _rebuildCacheEntries() {
-        root._setCacheList("_imageCacheEntries", _cacheWindowUrls(root._folderCache[root.wallpaperFolder] || [], root.currentWallpaperPath));
+        const images = root.useImageCatalog ? Media.videos(root.imageCatalog) : (root._folderCache[root.wallpaperFolder] || []);
+        root._setCacheList("_imageCacheEntries", _cacheWindowUrls(images, root.currentWallpaperPath));
         root._setCacheList("_videoCacheEntries", _cacheWindowUrls(Media.videos(root.videoCatalog), root.currentVideoPath));
     }
 
@@ -472,7 +493,7 @@ Item {
 
             readonly property int itemWidth:    parseInt(root.cfg.itemWidth)  || 300
             readonly property int itemHeight:   parseInt(root.cfg.itemHeight) || 420
-            readonly property size thumbnailSourceSize: Qt.size(2560, carousel.itemHeight * 2)
+            readonly property size thumbnailSourceSize: Qt.size(1280, Math.ceil(carousel.itemHeight * 1.6))
             readonly property int borderWidth:  (root.cfg.borderWidth  !== undefined) ? parseInt(root.cfg.borderWidth)  : 3
             readonly property int overlayOpacity: (root.cfg.overlayOpacity !== undefined) ? parseInt(root.cfg.overlayOpacity) : 80
             readonly property int cornerRadius: (root.cfg.cornerRadius !== undefined) ? parseInt(root.cfg.cornerRadius) : 0
@@ -502,14 +523,14 @@ Item {
             }
 
             property int confirmingIndex: -1
+            property string _pendingPickPath: ""
+            property string _pendingPickScreen: ""
 
             function confirmPick(idx, path) {
                 confirmingIndex = idx;
+                _pendingPickPath = path || "";
+                _pendingPickScreen = overlay.screen ? overlay.screen.name : "";
                 confirmTimer.start();
-                if (path) {
-                    const screenName = overlay.screen ? overlay.screen.name : "";
-                    root.wallpaperPicked(path, screenName);
-                }
             }
 
             Timer {
@@ -517,7 +538,13 @@ Item {
                 interval: 300
                 onTriggered: {
                     carousel.confirmingIndex = -1;
+                    const pickedPath = carousel._pendingPickPath;
+                    const pickedScreen = carousel._pendingPickScreen;
+                    carousel._pendingPickPath = "";
+                    carousel._pendingPickScreen = "";
                     root.close();
+                    if (pickedPath)
+                        root.wallpaperPicked(pickedPath, pickedScreen);
                 }
             }
 
@@ -633,7 +660,7 @@ Item {
 
                         scale:   isConfirmed ? 1.6 : isOtherConfirming ? (baseScale + scaleRange * delegateRoot.falloff) * 0.8 : isHovered ? baseScale + (scaleRange + 0.20) * delegateRoot.falloff : baseScale + scaleRange * delegateRoot.falloff
                         opacity: (isConfirmed ? 0.0 : isOtherConfirming ? 0.0 : isHovered ? 1.0 : 0.1 + 0.9 * delegateRoot.falloff) * delegateRoot._dupeFade
-                        layer.enabled: opacity < 1 && opacity > 0 && !isConfirmed
+                        layer.enabled: overlay.visible && opacity < 1 && opacity > 0 && !isConfirmed
 
                         Behavior on scale   { NumberAnimation { duration: 300; easing.type: Easing.OutBack } }
                         Behavior on opacity { NumberAnimation { duration: 300 } }
@@ -651,10 +678,10 @@ Item {
                                 width: parent.width; height: parent.height
                                 radius: carousel.cornerRadius
                                 visible: false
-                                layer.enabled: true
+                                layer.enabled: overlay.visible && carousel.enableRounding
                             }
 
-                            layer.enabled: carousel.enableRounding
+                            layer.enabled: overlay.visible && carousel.enableRounding
                             layer.effect: MultiEffect {
                                 maskEnabled: true
                                 maskSource: cornerMask
@@ -702,7 +729,12 @@ Item {
                                     width: parent.width + (parent.height * Math.abs(carousel.skewFactor)) + 50
                                     height: parent.height
                                     fillMode: Image.PreserveAspectCrop
-                                    source: (carousel.heldIndex === delegateRoot.index) ? delegateRoot.fileUrl : ""
+                                    cache: false
+                                    source: (overlay.visible && carousel.heldIndex === delegateRoot.index)
+                                        ? (!root.videoPage && delegateRoot.originalPath !== ""
+                                            ? "file://" + delegateRoot.originalPath.split("/").map(encodeURIComponent).join("/")
+                                            : delegateRoot.fileUrl)
+                                        : ""
                                     sourceSize: Qt.size(
                                         Math.max(carousel.thumbnailSourceSize.width, Math.ceil(carousel.width * carousel.holdExpandRatio * 2)),
                                         Math.max(carousel.thumbnailSourceSize.height, Math.ceil(carousel.height * carousel.holdExpandRatio * 2))
@@ -793,7 +825,7 @@ Item {
                 spacing: 0
                 orientation: ListView.Horizontal
                 clip: false
-                cacheBuffer: 5000
+                cacheBuffer: overlay.visible ? 1200 : 0
 
                 highlightRangeMode: ListView.StrictlyEnforceRange
                 preferredHighlightBegin: (width / 2) - (carousel.itemWidth / 2)

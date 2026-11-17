@@ -38,6 +38,17 @@ Item {
             seedPath = "";
         }
     }
+    function releaseAll() {
+        transitionAnimation.stop();
+        transitionActive = false;
+        staticStaged = false;
+        staticActive = false;
+        stagedPath = "";
+        frontIndex = -1;
+        seedPath = "";
+        slotA.release();
+        slotB.release();
+    }
     function stage(path) {
         if (transitionActive || frontIndex >= 0) finish();
         staticStaged = false;
@@ -123,7 +134,7 @@ Item {
             rootLayer.settings.zoom, rootLayer.motionProgress, rootLayer.seedBlend)
         x: geometry.x; y: geometry.y; width: geometry.width; height: geometry.height
         source: rootLayer.seedPath === "" ? "" : WallpaperMath.fileUrl(rootLayer.seedPath)
-        asynchronous: rootLayer.staticStaged
+        asynchronous: true
         visible: rootLayer.staticActive || (!rootLayer.staticStaged && (rootLayer.frontIndex < 0 || rootLayer.transitionActive))
         z: rootLayer.staticActive ? 2 : 0
         opacity: rootLayer.staticActive && rootLayer.transitionActive && !rootLayer.shaderEnabled ? rootLayer.transitionProgress : 1
@@ -137,6 +148,7 @@ Item {
         readonly property var geometry: WallpaperMath.modeGeometry(rootLayer.width, rootLayer.height, sourceWidth, sourceHeight,
             rootLayer.settings.zoom, rootLayer.motionProgress, rootLayer.modeBlend)
         x: geometry.x; y: geometry.y; width: geometry.width; height: geometry.height
+        trackFrames: rootLayer.transitionActive || rootLayer.stagedPath !== ""
         visible: rootLayer.staticActive ? (rootLayer.frontIndex === 0 && rootLayer.transitionActive) : (rootLayer.frontIndex === 0 || rootLayer.transitionActive || isStagedSlot)
         z: !rootLayer.staticActive && rootLayer.frontIndex === 0 ? 1 : (isStagedSlot ? -1 : 0)
         opacity: !rootLayer.staticActive && rootLayer.transitionActive && !rootLayer.shaderEnabled && rootLayer.frontIndex === 0 ? rootLayer.transitionProgress : 1
@@ -147,6 +159,7 @@ Item {
         readonly property var geometry: WallpaperMath.modeGeometry(rootLayer.width, rootLayer.height, sourceWidth, sourceHeight,
             rootLayer.settings.zoom, rootLayer.motionProgress, rootLayer.modeBlend)
         x: geometry.x; y: geometry.y; width: geometry.width; height: geometry.height
+        trackFrames: rootLayer.transitionActive || rootLayer.stagedPath !== ""
         visible: rootLayer.staticActive ? (rootLayer.frontIndex === 1 && rootLayer.transitionActive) : (rootLayer.frontIndex === 1 || rootLayer.transitionActive || isStagedSlot)
         z: !rootLayer.staticActive && rootLayer.frontIndex === 1 ? 1 : (isStagedSlot ? -1 : 0)
         opacity: !rootLayer.staticActive && rootLayer.transitionActive && !rootLayer.shaderEnabled && rootLayer.frontIndex === 1 ? rootLayer.transitionProgress : 1
