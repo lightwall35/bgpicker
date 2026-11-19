@@ -45,7 +45,7 @@ function geometry(width, height, imageWidth, imageHeight, zoom) {
 }
 
 function initialState() {
-    return {windows: [], workspaces: [], lastColumns: {}};
+    return {windows: [], workspaces: [], lastColumns: {}, overviewOpen: false};
 }
 
 function column(window) {
@@ -55,7 +55,15 @@ function column(window) {
 
 function reduce(state, event) {
     var windows = state.windows, workspaces = state.workspaces;
-    if (event.WorkspacesChanged) {
+    var overviewOpen = !!state.overviewOpen;
+    if (event.OverviewOpenedOrClosed) {
+        return {
+            windows: windows,
+            workspaces: workspaces,
+            lastColumns: state.lastColumns,
+            overviewOpen: !!event.OverviewOpenedOrClosed.is_open
+        };
+    } else if (event.WorkspacesChanged) {
         workspaces = event.WorkspacesChanged.workspaces;
     } else if (event.WorkspaceActivated) {
         var activation = event.WorkspaceActivated;
@@ -101,7 +109,7 @@ function reduce(state, event) {
         if (w.is_focused && column(w) !== null && workspaces.some(function(ws) { return ws.id === w.workspace_id; }))
             memory[w.workspace_id] = column(w);
     });
-    return {windows: windows, workspaces: workspaces, lastColumns: memory};
+    return {windows: windows, workspaces: workspaces, lastColumns: memory, overviewOpen: overviewOpen};
 }
 
 function progress(state, output, columnSpan) {

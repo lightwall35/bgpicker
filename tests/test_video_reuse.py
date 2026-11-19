@@ -54,7 +54,7 @@ class VideoRendererReuseTests(unittest.TestCase):
             if args[0] == 'status' and len(calls) == 1:
                 return json.dumps({'apiVersion': 2, 'currentPath': self.old})
             if args[0] == 'stage':
-                self.assertEqual(args, ('stage', self.new, self.blur, 'parallax'))
+                self.assertEqual(args, ('stage', self.new, '', 'parallax'))
                 return 'loading'
             if args[0] == 'ready':
                 readiness_checks += 1

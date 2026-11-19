@@ -1,3 +1,4 @@
+pragma ComponentBehavior: Bound
 import QtQuick
 import "WallpaperMath.js" as WallpaperMath
 import "WallpaperTransitions.js" as Transitions
@@ -17,8 +18,13 @@ Item {
     property real transitionProgress: 1
     property var transitionSpec: Transitions.settings({})
     property bool shaderFailed: false
+    property bool allowShader: true
+    property real textureScale: 1.0
+    property int minSlotFrames: 2
+    property var mirrorSourceLayer: null
+    property bool liveMirror: true
     readonly property bool presented: frontIndex >= 0 || staticActive
-    readonly property bool shaderEnabled: transitionActive && transitionSpec.type !== "fade"
+    readonly property bool shaderEnabled: allowShader && transitionActive && transitionSpec.type !== "fade"
         && transitionSpec.type !== "none" && GraphicsInfo.api !== GraphicsInfo.Software && !shaderFailed
     clip: true
 
@@ -28,17 +34,61 @@ Item {
         if (staticActive) return frontIndex >= 0 ? slot(frontIndex) : seed;
         return frontIndex >= 0 && slot(1 - frontIndex).mediaPath !== "" ? slot(1 - frontIndex) : seed;
     }
+    property int pendingReleaseIndex: -1
+    property int releaseDelayMs: 120
+    Timer {
+        id: releaseDelayTimer
+        interval: rootLayer.releaseDelayMs
+        repeat: false
+        onTriggered: {
+            if (rootLayer.pendingReleaseIndex >= 0) {
+                const idx = rootLayer.pendingReleaseIndex;
+                rootLayer.pendingReleaseIndex = -1;
+                if (idx !== rootLayer.frontIndex)
+                    rootLayer.slot(idx).release();
+            }
+        }
+    }
     function newItem() { return staticActive ? seed : slot(frontIndex); }
     function finish() {
         transitionAnimation.stop(); transitionActive = false; transitionProgress = 1;
         if (staticActive) {
+            releaseDelayTimer.stop();
+            pendingReleaseIndex = -1;
             slotA.release(); slotB.release(); frontIndex = -1;
         } else {
-            if (frontIndex >= 0) slot(1 - frontIndex).release();
+            // Pause immediately (<0.1ms) and stagger CUDA teardown on player layers;
+            // mirror layers have no decoder so release immediately to unbind first.
+            if (frontIndex >= 0) {
+                const oldIdx = 1 - frontIndex;
+                slot(oldIdx).pauseIdle();
+                const delay = rootLayer.mirrorSourceLayer ? 0 : releaseDelayMs;
+                if (delay > 0) {
+                    pendingReleaseIndex = oldIdx;
+                    releaseDelayTimer.interval = delay;
+                    releaseDelayTimer.restart();
+                } else {
+                    slot(oldIdx).release();
+                }
+            }
             seedPath = "";
         }
     }
+    function pauseActive() {
+        if (!staticActive && frontIndex >= 0 && !transitionActive)
+            slot(frontIndex).pauseIdle();
+    }
+    function resumeAndSync(other) {
+        if (staticActive || frontIndex < 0) return;
+        const active = slot(frontIndex);
+        const ref = other && other.frontIndex >= 0 ? other.slot(other.frontIndex) : null;
+        if (ref && ref.ready && active.ready && active.seekable && Math.abs(active.position - ref.position) > 150)
+            active.seek(ref.position);
+        active.resume();
+    }
     function releaseAll() {
+        releaseDelayTimer.stop();
+        pendingReleaseIndex = -1;
         transitionAnimation.stop();
         transitionActive = false;
         staticStaged = false;
@@ -51,6 +101,8 @@ Item {
     }
     function stage(path) {
         if (transitionActive || frontIndex >= 0) finish();
+        releaseDelayTimer.stop();
+        pendingReleaseIndex = -1;
         staticStaged = false;
         stagedPath = path; shaderFailed = false;
         incoming().load(path);
@@ -142,28 +194,51 @@ Item {
         cache: false
         sourceSize: Qt.size(rootLayer.settings.maxTextureSize, Math.min(rootLayer.settings.maxTextureSize, Math.ceil(rootLayer.height * 2 * rootLayer.settings.zoom)))
     }
-    VideoWallpaperSlot {
-        id: slotA
-        readonly property bool isStagedSlot: !rootLayer.staticStaged && rootLayer.stagedPath !== "" && rootLayer.frontIndex !== 0
+    Component { id: playerSlotComponent; VideoWallpaperSlot {} }
+    Component { id: mirrorSlotComponent; VideoMirrorSlot {} }
+    component VideoSlotHost : Item {
+        id: host
+        required property int slotIndex
+        readonly property var slotItem: loader.item
+        readonly property bool isStagedSlot: !rootLayer.staticStaged && rootLayer.stagedPath !== "" && rootLayer.frontIndex !== slotIndex
+        readonly property string mediaPath: slotItem ? slotItem.mediaPath : ""
+        readonly property bool ready: slotItem ? slotItem.ready : false
+        readonly property bool playing: slotItem ? slotItem.playing : false
+        readonly property int position: slotItem ? slotItem.position : 0
+        readonly property bool seekable: slotItem ? slotItem.seekable : false
+        readonly property int frameCount: slotItem ? slotItem.frameCount : 0
+        readonly property string failure: slotItem ? slotItem.failure : ""
+        readonly property real sourceWidth: slotItem ? slotItem.sourceWidth : 0
+        readonly property real sourceHeight: slotItem ? slotItem.sourceHeight : 0
+        readonly property var videoSink: slotItem ? slotItem.videoSink : null
         readonly property var geometry: WallpaperMath.modeGeometry(rootLayer.width, rootLayer.height, sourceWidth, sourceHeight,
             rootLayer.settings.zoom, rootLayer.motionProgress, rootLayer.modeBlend)
+        function load(path) { if (slotItem) slotItem.load(path); }
+        function pauseIdle() { if (slotItem) slotItem.pauseIdle(); }
+        function resume() { if (slotItem) slotItem.resume(); }
+        function seek(pos) { if (slotItem) slotItem.seek(pos); }
+        function release() { if (slotItem) slotItem.release(); }
+
         x: geometry.x; y: geometry.y; width: geometry.width; height: geometry.height
-        trackFrames: rootLayer.transitionActive || rootLayer.stagedPath !== ""
-        visible: rootLayer.staticActive ? (rootLayer.frontIndex === 0 && rootLayer.transitionActive) : (rootLayer.frontIndex === 0 || rootLayer.transitionActive || isStagedSlot)
-        z: !rootLayer.staticActive && rootLayer.frontIndex === 0 ? 1 : (isStagedSlot ? -1 : 0)
-        opacity: !rootLayer.staticActive && rootLayer.transitionActive && !rootLayer.shaderEnabled && rootLayer.frontIndex === 0 ? rootLayer.transitionProgress : 1
+        visible: rootLayer.staticActive
+            ? (rootLayer.frontIndex === slotIndex && rootLayer.transitionActive)
+            : (rootLayer.frontIndex === slotIndex || rootLayer.transitionActive || isStagedSlot)
+        z: !rootLayer.staticActive && rootLayer.frontIndex === slotIndex ? 1 : (isStagedSlot ? -1 : 0)
+        opacity: !rootLayer.staticActive && rootLayer.transitionActive && !rootLayer.shaderEnabled && rootLayer.frontIndex === slotIndex
+            ? rootLayer.transitionProgress : 1
+
+        Loader {
+            id: loader
+            anchors.fill: parent
+            sourceComponent: rootLayer.mirrorSourceLayer !== null ? mirrorSlotComponent : playerSlotComponent
+        }
+        Binding { when: loader.item !== null; target: loader.item; property: "trackFrames"; value: rootLayer.transitionActive || rootLayer.stagedPath !== "" }
+        Binding { when: loader.item !== null; target: loader.item; property: "minFrames"; value: rootLayer.minSlotFrames }
+        Binding { when: loader.item !== null && rootLayer.mirrorSourceLayer !== null; target: loader.item; property: "sourceSlot"; value: rootLayer.mirrorSourceLayer ? rootLayer.mirrorSourceLayer.slot(host.slotIndex) : null }
+        Binding { when: loader.item !== null && rootLayer.mirrorSourceLayer !== null; target: loader.item; property: "liveMirror"; value: rootLayer.liveMirror }
     }
-    VideoWallpaperSlot {
-        id: slotB
-        readonly property bool isStagedSlot: !rootLayer.staticStaged && rootLayer.stagedPath !== "" && rootLayer.frontIndex === 0
-        readonly property var geometry: WallpaperMath.modeGeometry(rootLayer.width, rootLayer.height, sourceWidth, sourceHeight,
-            rootLayer.settings.zoom, rootLayer.motionProgress, rootLayer.modeBlend)
-        x: geometry.x; y: geometry.y; width: geometry.width; height: geometry.height
-        trackFrames: rootLayer.transitionActive || rootLayer.stagedPath !== ""
-        visible: rootLayer.staticActive ? (rootLayer.frontIndex === 1 && rootLayer.transitionActive) : (rootLayer.frontIndex === 1 || rootLayer.transitionActive || isStagedSlot)
-        z: !rootLayer.staticActive && rootLayer.frontIndex === 1 ? 1 : (isStagedSlot ? -1 : 0)
-        opacity: !rootLayer.staticActive && rootLayer.transitionActive && !rootLayer.shaderEnabled && rootLayer.frontIndex === 1 ? rootLayer.transitionProgress : 1
-    }
+    VideoSlotHost { id: slotA; slotIndex: 0 }
+    VideoSlotHost { id: slotB; slotIndex: 1 }
     Item {
         anchors.fill: parent
         visible: rootLayer.shaderEnabled
@@ -173,14 +248,16 @@ Item {
             sourceItem: rootLayer.shaderEnabled ? rootLayer.oldItem() : null
             live: rootLayer.shaderEnabled
             hideSource: false
-            textureSize: Qt.size(Math.ceil(rootLayer.width), Math.ceil(rootLayer.height))
+            textureSize: Qt.size(Math.max(1, Math.ceil(rootLayer.width * rootLayer.textureScale)),
+                                 Math.max(1, Math.ceil(rootLayer.height * rootLayer.textureScale)))
         }
         ShaderEffectSource {
             id: afterTexture
             sourceItem: rootLayer.shaderEnabled ? rootLayer.newItem() : null
             live: rootLayer.shaderEnabled
             hideSource: rootLayer.shaderEnabled
-            textureSize: Qt.size(Math.ceil(rootLayer.width), Math.ceil(rootLayer.height))
+            textureSize: Qt.size(Math.max(1, Math.ceil(rootLayer.width * rootLayer.textureScale)),
+                                 Math.max(1, Math.ceil(rootLayer.height * rootLayer.textureScale)))
         }
         ShaderEffect {
             anchors.fill: parent

@@ -138,6 +138,14 @@ def prepare_blur(video):
         temporary.unlink(missing_ok=True)
 
 
+def ensure_native_plugin():
+    if (ROOT / 'BgPickerVideo/libbgpickervideo.so').exists():
+        return
+    result = subprocess.run([str(ROOT / 'build_native.sh')], capture_output=True, text=True, timeout=120)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or 'build_native.sh failed')
+
+
 def run_daemon(video, mode, token):
     children = []
     directory = RUNTIME / token
@@ -152,12 +160,14 @@ def run_daemon(video, mode, token):
     signal.signal(signal.SIGINT, terminate)
     try:
         atomic(status, 'preparing\n')
-        blurred_video = prepare_blur(video)
+        ensure_native_plugin()
         if terminating: raise RuntimeError('cancelled')
         ready_marker = directory / 'qs-ready'
         env = os.environ.copy()
-        env.update({'BGPICKER_VIDEO': video, 'BGPICKER_BLUR': blurred_video,
-                    'BGPICKER_MODE': mode, 'BGPICKER_QS_READY': str(ready_marker)})
+        qml_paths = [str(ROOT)] + ([env['QML_IMPORT_PATH']] if env.get('QML_IMPORT_PATH') else [])
+        env.update({'BGPICKER_VIDEO': video, 'BGPICKER_BLUR': '',
+                    'BGPICKER_MODE': mode, 'BGPICKER_QS_READY': str(ready_marker),
+                    'QML_IMPORT_PATH': ':'.join(qml_paths)})
         from wallpaper_settings import resolve, read_config
         env['BGPICKER_INITIAL_TRANSITION'] = json.dumps(resolve(read_config()))
         for state_name, env_name in [('current_wallpaper', 'BGPICKER_STATIC_FRONT'),
@@ -206,13 +216,12 @@ def qs_video(*args):
 
 def _drive_video_apply(ipc_fn, status, video, mode):
     from wallpaper_settings import resolve, read_config
-    blur = prepare_blur(video)
     if status.get('currentPath') == video:
         result = ipc_fn('mode', mode)
         if result.startswith('error:'): raise RuntimeError(result)
     else:
         try:
-            result = ipc_fn('stage', video, blur, mode)
+            result = ipc_fn('stage', video, '', mode)
             if result.startswith('error:'): raise RuntimeError(result)
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
@@ -340,7 +349,7 @@ def apply(video, mode):
                 if result == 'ready': break
                 if result.startswith('error:'): raise RuntimeError(result)
                 if result == 'preparing' and not announced:
-                    print('BgPicker: preparing cached blurred video (first use may take a while)...', flush=True)
+                    print('BgPicker: starting video renderer...', flush=True)
                     announced = True
             if p.poll() is not None: raise RuntimeError('video manager exited')
             time.sleep(.1)

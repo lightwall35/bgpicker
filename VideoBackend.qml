@@ -9,6 +9,7 @@ Item {
     readonly property var activeNiri: root.sharedNiri ? root.sharedNiri : localNiri
     readonly property bool niriConnected: activeNiri.connected
     readonly property var niriState: activeNiri.snapshot
+    readonly property bool overviewOpen: activeNiri.overviewOpen
 
     property bool resourcesEnabled: false
     property var screenViews: []
@@ -68,14 +69,15 @@ Item {
     }
 
     function stage(path, blur, mode) {
-        if (!path.startsWith("/") || !blur.startsWith("/")) return "error: absolute media paths required";
+        const safeBlur = blur || "";
+        if (!path.startsWith("/") || (safeBlur !== "" && !safeBlur.startsWith("/"))) return "error: absolute media paths required";
         if (mode !== "normal" && mode !== "parallax") return "error: unknown video mode";
         if (activeNiri.socketPath === "") return "error: NIRI_SOCKET is missing";
-        stagedPath = path; stagedBlur = blur; stagedMode = mode;
+        stagedPath = path; stagedBlur = safeBlur; stagedMode = mode;
         if (!resourcesEnabled) {
             resourcesEnabled = true;
         } else {
-            for (const view of screenViews) view.stage(path, blur);
+            for (const view of screenViews) view.stage(path, safeBlur);
         }
         return "loading";
     }
@@ -142,6 +144,7 @@ Item {
         catch (error) { return "error: invalid transition settings"; }
         if (snapshot.type === "random") snapshot.type = ["fade", "wipe", "wave", "grow", "outer"][Math.floor(Math.random() * 5)];
         for (const view of screenViews) view.commitStatic(path, stagedStaticBlur, snapshot);
+        currentPath = ""; currentBlur = "";
         stagedStaticPath = ""; stagedStaticBlur = "";
         return "ready";
     }

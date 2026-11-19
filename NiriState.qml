@@ -9,6 +9,7 @@ Item {
     readonly property bool connected: eventSocket.connected
     readonly property string socketPath: Quickshell.env("NIRI_SOCKET") || ""
     property var snapshot: WallpaperMath.initialState()
+    readonly property bool overviewOpen: !!(snapshot && snapshot.overviewOpen)
 
     function connectSocket() {
         if (subscribed && socketPath !== "" && !eventSocket.connected)

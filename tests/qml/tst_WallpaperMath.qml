@@ -82,8 +82,13 @@ TestCase {
     function test_unknown_events_and_reconnect_snapshot() {
         var s = fixture();
         compare(WallpaperMath.reduce(s, {NewFutureEvent: {}}), s);
+        s = WallpaperMath.reduce(s, {OverviewOpenedOrClosed: {is_open: true}});
+        verify(s.overviewOpen === true);
         s = WallpaperMath.reduce(s, {WorkspacesChanged: {workspaces: []}});
         compare(Object.keys(s.lastColumns).length, 0);
+        verify(s.overviewOpen === true);
+        s = WallpaperMath.reduce(s, {OverviewOpenedOrClosed: {is_open: false}});
+        verify(s.overviewOpen === false);
     }
     function test_settings_are_bounded_and_file_urls_escape_special_characters() {
         var p = WallpaperMath.settings({parallax: {zoom: 100, durationMs: -1, columnSpan: 0, maxTextureSize: "bad"}});

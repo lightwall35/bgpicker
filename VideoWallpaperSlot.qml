@@ -9,17 +9,25 @@ Item {
     property int frameCount: 0
     property string failure: ""
     property bool trackFrames: true
-    readonly property bool ready: decoded && frameCount >= 2 && player.hasVideo && player.error === MediaPlayer.NoError
+    property int minFrames: 2
+    readonly property bool ready: decoded && frameCount >= minFrames && player.hasVideo && player.error === MediaPlayer.NoError
     readonly property bool playing: player.playing
     readonly property int position: player.position
     readonly property bool seekable: player.seekable
     readonly property real sourceWidth: output.sourceRect.width
     readonly property real sourceHeight: output.sourceRect.height
+    readonly property var videoSink: output.videoSink
     function load(path) {
         player.stop(); output.clearOutput(); decoded = false; frameCount = 0; failure = "";
         mediaPath = path;
         // Decoding starts before readiness and continues throughout the effect.
         player.play();
+    }
+    function pauseIdle() {
+        player.pause();
+    }
+    function resume() {
+        if (mediaPath !== "") player.play();
     }
     function release() {
         player.stop(); mediaPath = ""; output.clearOutput(); decoded = false;

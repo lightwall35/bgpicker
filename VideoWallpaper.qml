@@ -28,17 +28,23 @@ Item {
                 NumberAnimation { id: modeAnimation; duration: root.backend.wallpaperSettings.modeTransitionMs; easing.type: Easing.InOutCubic }
             }
 
-            function stage(path, blur) { frontLayer.stage(path); backLayer.stage(blur); }
+            function stage(path, blur) {
+                backLayer.stage(path);
+                frontLayer.stage(path);
+            }
             function ready(path) {
                 const front = frontLayer.ready(path);
-                return front === "ready" ? backLayer.ready(root.backend.stagedBlur || root.backend.currentBlur) : front;
+                if (front !== "ready") return front;
+                return backLayer.ready(path);
             }
             function commit(path, blur, snapshot) {
-                backLayer.incoming().seek(frontLayer.incoming().position);
+                backLayer.commit(path, root.backend.overviewOpen ? snapshot : ({type: "none", durationMs: 0}));
                 frontLayer.commit(path, snapshot);
-                backLayer.commit(blur, snapshot);
             }
-            function cancel(path) { frontLayer.cancel(path); backLayer.cancel(root.backend.stagedBlur); }
+            function cancel(path) {
+                frontLayer.cancel(path);
+                backLayer.cancel(path);
+            }
             function stageStatic(path, blur, frontBlend, backBlend) {
                 frontLayer.stageStatic(path, frontBlend); backLayer.stageStatic(blur, backBlend);
             }
@@ -86,6 +92,12 @@ Item {
                     settings: root.backend.wallpaperSettings
                     motionProgress: display.animatedProgress
                     modeBlend: display.modeBlend
+                    mirrorSourceLayer: frontLayer
+                    liveMirror: root.backend.overviewOpen
+                    allowShader: root.backend.overviewOpen
+                    textureScale: 0.5
+                    minSlotFrames: 2
+                    releaseDelayMs: 0
                     Component.onCompleted: {
                         backLayer.seedBlend = root.backend.initialStaticBackBlend;
                         backLayer.seedPath = root.backend.initialStaticBlur;
@@ -109,6 +121,8 @@ Item {
                     settings: root.backend.wallpaperSettings
                     motionProgress: display.animatedProgress
                     modeBlend: display.modeBlend
+                    minSlotFrames: 6
+                    releaseDelayMs: 140
                     Component.onCompleted: {
                         frontLayer.seedBlend = root.backend.initialStaticFrontBlend;
                         frontLayer.seedPath = root.backend.initialStaticFront;
@@ -125,12 +139,6 @@ Item {
                         display.autoCommit = false;
                     }
                 }
-            }
-
-            Timer {
-                interval: 2000; repeat: true
-                running: display.frontReady && display.backReady && !display.transitioning && root.backend.stagedPath === ""
-                onTriggered: backLayer.syncWith(frontLayer)
             }
         }
     }
