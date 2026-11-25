@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bgpicker-core",
+    "crates/bgpicker-gfx",
+    "crates/bgpicker-video",
+    "crates/bgpicker-daemon",
+]

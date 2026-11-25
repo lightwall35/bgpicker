@@ -13,3 +13,6 @@ __pycache__/
 # Built native QML plugin artifacts
 /native/build/
 /BgPickerVideo/
+
+# Cargo build output
+target/

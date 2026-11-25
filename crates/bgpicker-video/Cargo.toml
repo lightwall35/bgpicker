@@ -1,0 +1,14 @@
+[package]
+name = "bgpicker-video"
+version = "0.1.0"
+edition = "2021"
+description = "Async off-thread hardware-accelerated video decoder for bgpicker wallpaper and backdrop"
+build = "build.rs"
+
+[dependencies]
+libc = "0.2"
+thiserror = "2"
+
+[build-dependencies]
+cc = "1.2"
+pkg-config = "0.3"

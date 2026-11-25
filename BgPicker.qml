@@ -6,12 +6,11 @@ import "WallpaperTransitions.js" as Transitions
 // ==============================================================================
 // BgPicker — Carousel wrapper and serialized wallpaper/mode requests.
 //
-// Connect the shell-agnostic Carousel.qml to the mode-aware switcher.
+// Connect the shell-agnostic Carousel.qml to bgpickerctl / bgpicker-daemon.
 // ==============================================================================
 
 Item {
     id: root
-    required property var backend
 
     // ── Configuration ─────────────────────────────────────────────────────────
     // Resolved path to the directory containing this QML file (and the scripts)
@@ -23,11 +22,15 @@ Item {
         return decodeURIComponent(url);
     }
 
-    // Originals live alongside the project; blurred images are generated on demand.
+    // Originals live alongside the project; blurred/thumbnail caches are managed by the daemon.
     readonly property string wallpaperDir: installDir + "/wallpapers"
-    readonly property string currentWallpaperFile:
+    readonly property string stateDir:
         (Quickshell.env("XDG_STATE_HOME") || Quickshell.env("HOME") + "/.local/state")
-        + "/bgpicker/current_wallpaper"
+        + "/bgpicker"
+    readonly property string currentWallpaperFile: stateDir + "/current_wallpaper"
+    readonly property string settingsPath:
+        (Quickshell.env("XDG_CONFIG_HOME") || Quickshell.env("HOME") + "/.config")
+        + "/bgpicker/settings.json"
 
     // ── State ─────────────────────────────────────────────────────────────────
     property string currentWallpaper: ""
@@ -36,10 +39,21 @@ Item {
     property string currentVideo: ""
     property string videoMode: "normal"
     property string engine: "full"
+    property string transitionType: "fade"
     property var imageCatalog: []
     property var videoCatalog: []
     property string lastError: ""
     readonly property bool busy: switchProcess.running || preferencesProcess.running || pendingCommand.length > 0
+
+    function ctlCommand(args) {
+        const script = 'ctl="${BGPICKERCTL:-}"; '
+            + '[ -n "$ctl" ] || ctl="$(command -v bgpickerctl 2>/dev/null || true)"; '
+            + '[ -n "$ctl" ] || [ ! -x "$1/target/release/bgpickerctl" ] || ctl="$1/target/release/bgpickerctl"; '
+            + '[ -n "$ctl" ] || [ ! -x "$1/target/debug/bgpickerctl" ] || ctl="$1/target/debug/bgpickerctl"; '
+            + '[ -n "$ctl" ] || { echo "BgPicker: bgpickerctl not found" >&2; exit 127; }; '
+            + 'shift; exec "$ctl" "$@"';
+        return ["sh", "-c", script, "bgpicker-ctl", root.installDir].concat(args);
+    }
 
     // Also observe switches made through the command-line helper.
     FileView {
@@ -55,7 +69,7 @@ Item {
     }
 
     FileView {
-        path: root.currentWallpaperFile.slice(0, -"current_wallpaper".length) + "mode"
+        path: root.stateDir + "/mode"
         preload: true
         printErrors: false
         watchChanges: true
@@ -67,26 +81,46 @@ Item {
     }
 
     FileView {
-        path: root.currentWallpaperFile.slice(0, -"current_wallpaper".length) + "engine"
+        path: root.stateDir + "/engine"
         preload: true; watchChanges: true; printErrors: false
-        onLoaded: root.engine = text().trim()
+        onLoaded: root.engine = text().trim() || "full"
         onFileChanged: reload()
     }
+
     FileView {
-        path: root.currentWallpaperFile.slice(0, -"current_wallpaper".length) + "video-wallpaper"
+        path: root.stateDir + "/video-wallpaper"
         preload: true; watchChanges: true; printErrors: false
         onLoaded: root.currentVideo = text().replace(/\n$/, "")
         onFileChanged: reload()
     }
+
     FileView {
-        path: root.currentWallpaperFile.slice(0, -"current_wallpaper".length) + "video-mode"
+        path: root.stateDir + "/video-mode"
         preload: true; watchChanges: true; printErrors: false
         onLoaded: root.videoMode = text().trim() === "parallax" ? "parallax" : "normal"
         onFileChanged: reload()
     }
+
+    FileView {
+        id: settingsFile
+        path: root.settingsPath
+        preload: true; watchChanges: true; printErrors: false
+        onLoaded: {
+            try {
+                const config = JSON.parse(text());
+                if (config && typeof config === "object" && !Array.isArray(config)) {
+                    root.transitionType = Transitions.settings(config).type;
+                }
+            } catch (error) {
+                console.warn("BgPicker: keeping previous settings; invalid JSON:", error);
+            }
+        }
+        onFileChanged: reload()
+    }
+
     Process {
         id: catalogProcess
-        command: ["python3", root.installDir + "/media_catalog.py", "--bundle", root.wallpaperDir, root.installDir + "/dynamic"]
+        command: root.ctlCommand(["catalog", "--images", root.wallpaperDir, "--videos", root.installDir + "/dynamic"])
         stdout: StdioCollector { id: catalogOutput }
         onExited: (code, status) => {
             if (code === 0) {
@@ -111,17 +145,31 @@ Item {
     function toggleMode() {
         if (busy) return;
         if (carousel.videoPage && currentVideo !== "") {
-            pendingCommand = [installDir + "/picker_action.sh", "video", videoMode === "normal" ? "parallax" : "normal", currentVideo];
+            pendingCommand = root.ctlCommand([
+                "apply-video",
+                videoMode === "normal" ? "parallax" : "normal",
+                currentVideo
+            ]);
         } else if (!carousel.videoPage && currentWallpaper !== "") {
-            pendingCommand = [installDir + "/picker_action.sh", "mode", "toggle"];
+            if (root.engine !== "full") {
+                pendingCommand = root.ctlCommand([
+                    "apply-static",
+                    currentWallpaper,
+                    "--mode",
+                    wallpaperMode === "parallax" ? "awww" : "parallax"
+                ]);
+            } else {
+                pendingCommand = root.ctlCommand(["mode", "toggle"]);
+            }
         }
         processNextWallpaper();
     }
 
     function selectTransition(type) {
-        if (busy || type === backend.transition.type) return;
+        if (busy || type === root.transitionType) return;
         lastError = "";
-        preferencesProcess.command = ["python3", installDir + "/wallpaper_settings.py", "set-transition", type];
+        preferencesProcess.pendingType = type;
+        preferencesProcess.command = root.ctlCommand(["transition", type]);
         preferencesProcess.running = true;
     }
 
@@ -129,9 +177,16 @@ Item {
         target: "wallpaperPicker"
         function motion(): string { if (root.busy) return "busy"; root.toggleMode(); return "started"; }
         function transition(type: string): string { if (root.busy) return "busy"; root.selectTransition(type); return "saved"; }
-        function status(): string { return JSON.stringify({busy: root.busy, engine: root.engine,
-            page: carousel.videoPage ? "video" : "static", mode: carousel.wallpaperMode,
-            transition: root.backend.transition.type, error: root.lastError}); }
+        function status(): string {
+            return JSON.stringify({
+                busy: root.busy,
+                engine: root.engine,
+                page: carousel.videoPage ? "video" : "static",
+                mode: carousel.wallpaperMode,
+                transition: root.transitionType,
+                error: root.lastError
+            });
+        }
     }
 
     // ── The Carousel ──────────────────────────────────────────────────────────
@@ -172,7 +227,7 @@ Item {
         wallpaperMode: carousel.videoPage ? (root.videoMode === "parallax" ? "parallax" : "awww") : root.wallpaperMode
         wallpaperModeBusy: root.busy
         wallpaperModeAvailable: carousel.videoPage ? root.currentVideo !== "" : root.currentWallpaper !== ""
-        wallpaperTransition: root.backend.transition.type
+        wallpaperTransition: root.transitionType
         wallpaperTransitionChoices: Transitions.choices
         wallpaperError: root.lastError
         onWallpaperModeToggleRequested: root.toggleMode()
@@ -182,11 +237,10 @@ Item {
         // (for multi-monitor, this could be enhanced to detect the focused screen)
         getFocusedScreen: () => Quickshell.screens.length > 0 ? Quickshell.screens[0] : null
 
-        // The script resolves the blurred variant; the UI only passes the original.
         onWallpaperPicked: (fullPath, screenName) => {
             root.pendingCommand = carousel.videoPage
-                ? [root.installDir + "/picker_action.sh", "video", root.videoMode, fullPath]
-                : [root.installDir + "/picker_action.sh", "static", fullPath];
+                ? root.ctlCommand(["apply-video", root.videoMode, fullPath])
+                : root.ctlCommand(["apply-static", fullPath]);
             root.processNextWallpaper();
         }
     }
@@ -197,8 +251,8 @@ Item {
         stderr: StdioCollector { id: switchErrors }
         onExited: (exitCode, exitStatus) => {
             if (exitCode !== 0 || exitStatus !== 0) {
-                root.lastError = switchErrors.text.trim() || "壁纸切换失败，请查看 Quickshell 日志。";
-                console.warn("BgPicker: switch_wallpaper.sh exited with code", exitCode);
+                root.lastError = switchErrors.text.trim() || "壁纸切换失败，请查看后台服务日志。";
+                console.warn("BgPicker: bgpickerctl exited with code", exitCode);
             }
             Qt.callLater(root.processNextWallpaper);
         }
@@ -206,31 +260,23 @@ Item {
 
     Process {
         id: preferencesProcess
+        property string pendingType: ""
         stderr: StdioCollector { id: preferencesErrors }
         onExited: (exitCode, exitStatus) => {
             if (exitCode === 0 && exitStatus === 0) {
-                root.backend.reloadSettings();
+                if (pendingType !== "") root.transitionType = pendingType;
+                settingsFile.reload();
             } else {
                 root.lastError = preferencesErrors.text.trim() || "切换效果保存失败。";
             }
+            pendingType = "";
             Qt.callLater(root.processNextWallpaper);
-        }
-    }
-
-    Timer {
-        interval: 750
-        running: true
-        onTriggered: {
-            if (!root.busy && root.engine === "full") {
-                root.pendingCommand = [root.installDir + "/switch_wallpaper.sh", "--restore"];
-                root.processNextWallpaper();
-            }
         }
     }
 
     Component.onCompleted: {
         catalogProcess.running = true;
-        console.info("BgPicker: daemon loaded");
+        console.info("BgPicker: picker loaded");
         console.info("  wallpaper dir: " + root.wallpaperDir);
         console.info("  Toggle with: qs ipc -p " + root.installDir + " call wallpaperCarousel toggle");
     }
