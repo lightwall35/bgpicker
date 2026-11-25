@@ -155,6 +155,18 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         video_dir: Option<PathBuf>,
     },
+    ClearCache,
+}
+
+/// Runtime memory report returned by [`Request::ClearCache`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearCacheReport {
+    pub rss_before_kib: u64,
+    pub rss_after_kib: u64,
+    pub pss_before_kib: u64,
+    pub pss_after_kib: u64,
+    pub video_backend_stopped: bool,
 }
 
 /// Per-output live state reported in [`DaemonStatus`].
@@ -199,6 +211,7 @@ pub enum ResponseData {
     TransitionSettings(TransitionSettings),
     ResolvedTransition(ResolvedTransition),
     Catalog(CatalogBundle),
+    CacheCleared(ClearCacheReport),
     Message(String),
 }
 

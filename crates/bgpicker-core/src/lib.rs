@@ -29,6 +29,6 @@ pub use paths::{
     PersistedState, VideoMode, WallpaperMode,
 };
 pub use protocol::{
-    BackdropAction, EngineAction, IpcClient, ModeAction, OutputStatus, ProtocolError, Request,
-    Response, ResponseData, DaemonStatus, VideoModeAction,
+    BackdropAction, ClearCacheReport, DaemonStatus, EngineAction, IpcClient, ModeAction,
+    OutputStatus, ProtocolError, Request, Response, ResponseData, VideoModeAction,
 };

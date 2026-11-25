@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use bgpicker_core::config::TransitionType;
 use bgpicker_core::paths::{atomic_write_text, BgPickerPaths, EngineKind, PersistedState};
 use bgpicker_core::protocol::{
-    BackdropAction, BackdropOverride, DaemonStatus, EngineAction, IpcClient, ModeAction, Request,
-    ResponseData, VideoModeAction,
+    BackdropAction, BackdropOverride, ClearCacheReport, DaemonStatus, EngineAction, IpcClient,
+    ModeAction, Request, ResponseData, VideoModeAction,
 };
 
 use crate::actor::list_videos_sorted;
@@ -88,6 +88,11 @@ pub enum CtlCommand {
     },
     Picker {
         action: PickerAction,
+    },
+    ClearCache {
+        deep: bool,
+        picker: bool,
+        disk: bool,
     },
 }
 
@@ -241,6 +246,7 @@ where
             }
             _ => return Err("usage: bgpickerctl picker {toggle|open|close|next|prev}".into()),
         },
+        "clear-cache" | "trim" => parse_clear_cache(rest)?,
         other => return Err(format!("unknown subcommand '{other}'\n\n{}", usage_text())),
     };
 
@@ -570,6 +576,30 @@ fn parse_catalog(rest: &[String]) -> Result<CtlCommand, String> {
     Ok(CtlCommand::Catalog { images, videos })
 }
 
+fn parse_clear_cache(rest: &[String]) -> Result<CtlCommand, String> {
+    let mut deep = false;
+    let mut picker = false;
+    let mut disk = false;
+    for arg in rest {
+        match arg.as_str() {
+            "--deep" | "--restart" => deep = true,
+            "--picker" => picker = true,
+            "--disk" => disk = true,
+            "--all" => {
+                deep = true;
+                picker = true;
+                disk = true;
+            }
+            other => {
+                return Err(format!(
+                    "unknown clear-cache flag '{other}' (expected --deep|--picker|--disk|--all)"
+                ))
+            }
+        }
+    }
+    Ok(CtlCommand::ClearCache { deep, picker, disk })
+}
+
 pub fn usage_text() -> String {
     "\
 Usage: bgpickerctl [--socket PATH] [--project-dir DIR] <command>
@@ -587,7 +617,8 @@ Commands:
   transition [fade|wipe|wave|grow|outer|random|none]
   reload-settings
   catalog [--images <dir>] [--videos <dir>]
-  picker {toggle|open|close|next|prev}"
+  picker {toggle|open|close|next|prev}
+  clear-cache [--deep] [--picker] [--disk] [--all]"
         .to_string()
 }
 
@@ -937,6 +968,9 @@ pub fn execute(global: CtlGlobalOpts, cmd: CtlCommand) -> Result<Option<String>,
             }
             Ok(None)
         }
+        CtlCommand::ClearCache { deep, picker, disk } => {
+            execute_clear_cache(&client, &paths, &project_dir, deep, picker, disk)
+        }
     }
 }
 
@@ -1227,4 +1261,172 @@ fn stop_daemon_if_live(client: &IpcClient) -> Result<bool, String> {
         thread::sleep(Duration::from_millis(50));
     }
     Err("bgpicker daemon has not stopped yet.".into())
+}
+
+fn execute_clear_cache(
+    client: &IpcClient,
+    paths: &BgPickerPaths,
+    project_dir: &Path,
+    deep: bool,
+    picker: bool,
+    disk: bool,
+) -> Result<Option<String>, String> {
+    let mut lines = Vec::new();
+
+    if is_daemon_live(client) {
+        let st = fetch_status(client)?;
+        let report = call_clear_cache(client)?;
+        if deep {
+            if st.engine == EngineKind::Video {
+                lines.push(format!(
+                    "daemon trimmed (skipped --deep restart during video): PSS {} -> {}, RSS {} -> {}",
+                    format_kib_human(report.pss_before_kib),
+                    format_kib_human(report.pss_after_kib),
+                    format_kib_human(report.rss_before_kib),
+                    format_kib_human(report.rss_after_kib),
+                ));
+            } else {
+                stop_daemon_if_live(client)?;
+                ensure_daemon_live(client, paths, project_dir, true)?;
+                call_checked(client, &Request::Startup)?;
+                let fresh = call_clear_cache(client)?;
+                lines.push(format!(
+                    "daemon restarted (--deep): PSS {} -> {}, RSS {} -> {}",
+                    format_kib_human(report.pss_before_kib),
+                    format_kib_human(fresh.pss_after_kib),
+                    format_kib_human(report.rss_before_kib),
+                    format_kib_human(fresh.rss_after_kib),
+                ));
+            }
+        } else {
+            let video_note = if report.video_backend_stopped {
+                ", idle video worker released"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "daemon trimmed: PSS {} -> {}, RSS {} -> {}{video_note}",
+                format_kib_human(report.pss_before_kib),
+                format_kib_human(report.pss_after_kib),
+                format_kib_human(report.rss_before_kib),
+                format_kib_human(report.rss_after_kib),
+            ));
+        }
+    } else {
+        lines.push("daemon: not running".into());
+    }
+
+    if picker {
+        if is_quickshell_running(project_dir) {
+            stop_quickshell_and_wait(project_dir);
+            ensure_quickshell_running(project_dir)?;
+            lines.push("qs picker: restarted".into());
+        } else {
+            lines.push("qs picker: not running".into());
+        }
+    }
+
+    if disk {
+        let freed = clean_disk_caches(paths)?;
+        lines.push(format!("disk caches cleared: {}", format_bytes_human(freed)));
+    }
+
+    Ok(Some(lines.join("\n")))
+}
+
+fn call_clear_cache(client: &IpcClient) -> Result<ClearCacheReport, String> {
+    let resp = call_checked(client, &Request::ClearCache)?;
+    match resp.data {
+        Some(ResponseData::CacheCleared(report)) => Ok(report),
+        _ => Err("daemon returned unexpected clear-cache payload".into()),
+    }
+}
+
+fn stop_quickshell_and_wait(project_dir: &Path) {
+    stop_quickshell_best_effort(project_dir);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if !is_quickshell_running(project_dir) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn clean_disk_caches(paths: &BgPickerPaths) -> Result<u64, String> {
+    let persisted = PersistedState::load(paths);
+    let keep_blur_file = if persisted.engine == EngineKind::Simple {
+        fs::read_to_string(paths.legacy_swaybg_cache_file())
+            .ok()
+            .map(|s| PathBuf::from(s.trim()))
+            .filter(|p| !p.as_os_str().is_empty())
+    } else {
+        None
+    };
+
+    let mut freed = 0u64;
+    for dir in [
+        paths.video_blur_cache_dir(),
+        paths.image_thumbnails_dir(),
+        paths.video_thumbnails_dir(),
+        paths.blur_cache_dir(),
+    ] {
+        freed += clear_cache_dir(&dir, keep_blur_file.as_deref()).map_err(|e| e.to_string())?;
+    }
+
+    for log_name in ["daemon.log", "simple-swaybg.log", "video.log"] {
+        let log_path = paths.cache_dir.join(log_name);
+        if let Ok(meta) = fs::metadata(&log_path) {
+            if meta.is_file()
+                && meta.len() > 0
+                && OpenOptions::new().write(true).truncate(true).open(&log_path).is_ok()
+            {
+                freed += meta.len();
+            }
+        }
+    }
+    Ok(freed)
+}
+
+fn clear_cache_dir(dir: &Path, keep_file: Option<&Path>) -> std::io::Result<u64> {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return Ok(0);
+    };
+    let mut freed = 0u64;
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            freed += clear_cache_dir(&path, keep_file)?;
+            let _ = fs::remove_dir(&path);
+            continue;
+        }
+        if keep_file.is_some_and(|k| k == path) {
+            continue;
+        }
+        let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if fs::remove_file(&path).is_ok() {
+            freed += len;
+        }
+    }
+    Ok(freed)
+}
+
+fn format_kib_human(kib: u64) -> String {
+    format_bytes_human(kib.saturating_mul(1024))
+}
+
+fn format_bytes_human(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * KIB;
+    const GIB: f64 = 1024.0 * MIB;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.2} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.0} KiB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
 }

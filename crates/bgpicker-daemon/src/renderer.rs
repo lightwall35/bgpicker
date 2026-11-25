@@ -69,6 +69,7 @@ pub trait RendererBackend: Send + Sync {
         parallax: GfxParallaxSettings,
         kawase: KawaseSettings,
     ) -> Result<(), String>;
+    fn trim_idle(&self) -> Result<(), String>;
     fn clear(&self) -> Result<(), String>;
     fn shutdown(&self);
     fn snapshots(&self) -> Vec<OutputSnapshot>;
@@ -184,6 +185,12 @@ impl RendererBackend for GfxRendererBackend {
     ) -> Result<(), String> {
         self.handle
             .send(RenderCommand::UpdateSettings { parallax, kawase })
+            .map_err(|e| e.to_string())
+    }
+
+    fn trim_idle(&self) -> Result<(), String> {
+        self.handle
+            .send(RenderCommand::TrimIdle)
             .map_err(|e| e.to_string())
     }
 

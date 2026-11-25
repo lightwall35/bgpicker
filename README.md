@@ -25,6 +25,8 @@
 ./bgpicker.sh engine full              # 恢复完整静态壁纸模式
 ./bgpicker.sh engine simple            # 切换到双 swaybg 简洁模式
 ./bgpicker.sh status                   # 查看守护进程与输出状态
+./bgpicker.sh clear-cache [--deep] [--picker] [--disk] [--all]  # 手动清理空闲缓存与内存
+./bgpicker_stats.sh [-w [秒数]]        # 一键抓取 bgpicker-daemon 与 qs 的 CPU/PSS/VRAM 占用
 ```
 
 也可以直接使用编译好的 `bgpickerctl` 客户端（位于 `target/release/bgpickerctl` 或环境变量 `BGPICKERCTL` 指定路径）：
@@ -38,6 +40,7 @@ bgpickerctl backdrop-parallax [on|off|toggle]
 bgpickerctl transition [fade|wipe|wave|grow|outer|random|none]
 bgpickerctl engine [status|full|simple|video|toggle]
 bgpickerctl reload-settings
+bgpickerctl clear-cache [--deep] [--picker] [--disk] [--all]
 ```
 
 按 `Mod+N`（或 `./bgpicker.sh toggle`）打开选择器面板：

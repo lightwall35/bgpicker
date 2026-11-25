@@ -483,6 +483,25 @@ impl LayerPipeline {
         }
         self.needs_redraw = true;
     }
+
+    /// Releases idle scratch resources (inactive slot and intermediate Dual-Kawase
+    /// FBO chain once cached blur is ready) without disturbing the active image.
+    pub fn trim_idle(&mut self, gl: &glow::Context) {
+        if self.transition_active || self.staged_slot.is_some() {
+            return;
+        }
+        let Some(front_idx) = self.front_index else {
+            return;
+        };
+        let idle_idx = 1 - front_idx;
+        self.slots[idle_idx].release(gl);
+
+        if self.slots[front_idx].cached_blur.is_some()
+            && let Some(ref mut blur) = self.blur
+        {
+            blur.destroy(gl);
+        }
+    }
 }
 
 #[inline]

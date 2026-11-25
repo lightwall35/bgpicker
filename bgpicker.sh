@@ -166,8 +166,12 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                 exit 1
             fi
             ;;
+        clear-cache|trim)
+            shift
+            exec "$CTL" clear-cache "$@"
+            ;;
         *)
-            echo "Usage: $0 {start|stop|toggle|open|close|next|prev|mode [awww|parallax|toggle]|backdrop-parallax [on|off|toggle]|transition [type]|engine [status|simple|full|video|toggle|startup]|video [status|normal|parallax [file]|next]}" >&2
+            echo "Usage: $0 {start|stop|toggle|open|close|next|prev|mode [awww|parallax|toggle]|backdrop-parallax [on|off|toggle]|transition [type]|engine [status|simple|full|video|toggle|startup]|video [status|normal|parallax [file]|next]|clear-cache [--deep] [--picker] [--disk] [--all]}" >&2
             exit 1
             ;;
     esac

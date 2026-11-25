@@ -749,3 +749,53 @@ fn backdrop_feature_brightness_is_shift_invariant_across_subpixel_panning() {
     target.destroy(&egl.gl);
     programs.destroy(&egl.gl);
 }
+
+#[test]
+fn trim_idle_releases_scratch_fbos_without_invalidating_cached_static_blur() {
+    let egl = EglContext::new_headless().expect("headless EGL context");
+    let programs = ShaderPrograms::compile(&egl.gl, egl.is_gles).expect("compile shaders");
+
+    let (vw, vh) = (160u32, 90u32);
+    let (mw, mh) = (320u32, 90u32);
+    let zoom = 1.12f32;
+    let kawase = KawaseSettings::default();
+    let target = OffscreenTarget::new(&egl.gl, vw, vh);
+
+    let mut data = vec![20u8; mw as usize * mh as usize * 4];
+    for y in 0..mh {
+        for x in 140..180 {
+            let idx = ((y * mw + x) * 4) as usize;
+            data[idx] = 230;
+            data[idx + 1] = 200;
+            data[idx + 2] = 60;
+            data[idx + 3] = 255;
+        }
+    }
+    let frame = FrameInput::from_rgba("trim-test.png", 1, mw, mh, None, data).unwrap();
+
+    let mut backdrop = LayerPipeline::new(LayerRole::Backdrop, true);
+    backdrop
+        .apply_frame(&egl.gl, &frame, TransitionSpec::instant(), egl.bgra_ext_supported)
+        .unwrap();
+    backdrop.set_progress(0.3, 0);
+    backdrop
+        .render(&egl.gl, &programs, Some(target.fbo), vw, vh, zoom, kawase)
+        .unwrap();
+    assert_eq!(backdrop.blur_compute_count(), 1);
+    let before = target.read_pixel_at_px_top_down(&egl.gl, vw / 2, vh / 2);
+
+    // Trimming idle scratch FBOs must keep the cached blurred image intact for panning.
+    backdrop.trim_idle(&egl.gl);
+    backdrop.set_progress(0.5, 0);
+    backdrop
+        .render(&egl.gl, &programs, Some(target.fbo), vw, vh, zoom, kawase)
+        .unwrap();
+    assert_eq!(backdrop.blur_compute_count(), 1);
+    let panned = target.read_pixel_at_px_top_down(&egl.gl, vw / 2, vh / 2);
+    assert!(panned != [0.0, 0.0, 0.0, 0.0]);
+    assert!(before[3] > 0.9 && panned[3] > 0.9);
+
+    backdrop.release_all(&egl.gl);
+    target.destroy(&egl.gl);
+    programs.destroy(&egl.gl);
+}

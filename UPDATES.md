@@ -186,6 +186,7 @@
 ### 3. `rust` 分支验证状态
 
 - `cargo clippy --workspace --all-targets -- -D warnings`：零警告通过。
-- `cargo test --workspace`：54 项全部通过（覆盖 `bgpicker-core`、`bgpicker-gfx`、`bgpicker-video`、`bgpicker-daemon`）。
+- `cargo test --workspace`：57 项全部通过（覆盖 `bgpicker-core`、`bgpicker-gfx`、`bgpicker-video`、`bgpicker-daemon`，含后续新增的 `clear-cache` 与 `trim_idle` 测试）。
 - `cargo build --release`：构建成功（`target/release/bgpicker-daemon`、`target/release/bgpickerctl`）。
 - Shell 语法检查（`bash -n`）、Python 单元测试（`python3 -m unittest`）、离线 QML 测试（`qmltestrunner -input tests/qml`）均全部通过。
+- 新增 `bgpickerctl clear-cache`（及 `./bgpicker.sh clear-cache` / `trim`）与 `./bgpicker_stats.sh`：静态模式下支持按需关闭空闲视频后端、释放 `DualKawaseBlur` 中间 FBO 与 CPU 帧缓冲、调用 `malloc_trim(0)` 回收堆内存，并支持 `--deep`、`--picker`、`--disk` 分级清理与人类可读资源占用快照。

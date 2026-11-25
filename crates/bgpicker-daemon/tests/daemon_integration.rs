@@ -106,12 +106,14 @@ enum RecordedRenderOp {
 struct MockRenderer {
     ops: Mutex<Vec<RecordedRenderOp>>,
     outputs: Mutex<Vec<OutputSnapshot>>,
+    trim_calls: AtomicU64,
 }
 
 impl MockRenderer {
     fn new() -> Self {
         Self {
             ops: Mutex::new(Vec::new()),
+            trim_calls: AtomicU64::new(0),
             outputs: Mutex::new(vec![OutputSnapshot {
                 name: "DP-1".into(),
                 wallpaper: SurfaceSnapshot {
@@ -231,6 +233,11 @@ impl RendererBackend for MockRenderer {
         Ok(())
     }
 
+    fn trim_idle(&self) -> Result<(), String> {
+        self.trim_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     fn clear(&self) -> Result<(), String> {
         Ok(())
     }
@@ -247,6 +254,7 @@ struct MockVideo {
     overview_history: Mutex<Vec<bool>>,
     active_path: Mutex<Option<PathBuf>>,
     next_id: AtomicU64,
+    shutdown_calls: AtomicU64,
     fail_next: Mutex<bool>,
 }
 
@@ -257,6 +265,7 @@ impl MockVideo {
             overview_history: Mutex::new(Vec::new()),
             active_path: Mutex::new(None),
             next_id: AtomicU64::new(1),
+            shutdown_calls: AtomicU64::new(0),
             fail_next: Mutex::new(false),
         }
     }
@@ -300,7 +309,9 @@ impl VideoBackend for MockVideo {
         self.active_path.lock().unwrap().as_deref() == Some(path)
     }
 
-    fn shutdown(&self) {}
+    fn shutdown(&self) {
+        self.shutdown_calls.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[test]
@@ -1549,4 +1560,162 @@ fn end_to_end_live_wayland_simple_engine_handoff() {
 
     assert!(run_ctl(&["stop"]).status.success());
     assert!(!sock.exists());
+}
+
+#[test]
+fn clear_cache_cli_parser_and_actor_trim_behavior() {
+    let (_, c) = parse_args(["clear-cache"]).unwrap();
+    assert_eq!(
+        c,
+        CtlCommand::ClearCache {
+            deep: false,
+            picker: false,
+            disk: false
+        }
+    );
+    let (_, c) = parse_args(["trim", "--all"]).unwrap();
+    assert_eq!(
+        c,
+        CtlCommand::ClearCache {
+            deep: true,
+            picker: true,
+            disk: true
+        }
+    );
+    assert!(parse_args(["clear-cache", "--bogus"]).is_err());
+
+    let tmp = TempDir::new("clear_cache_actor");
+    let proj = tmp.path().join("project");
+    let img = proj.join("wallpapers/a.png");
+    let vid = proj.join("dynamic/loop.mp4");
+    fs::create_dir_all(img.parent().unwrap()).unwrap();
+    write_tiny_png(&img);
+    fs::create_dir_all(vid.parent().unwrap()).unwrap();
+    fs::write(&vid, b"dummy").unwrap();
+
+    let paths = BgPickerPaths::with_roots(
+        tmp.path().join("home"),
+        tmp.path().join("config"),
+        tmp.path().join("cache"),
+        tmp.path().join("state"),
+        tmp.path().join("run"),
+    );
+
+    let renderer = Arc::new(MockRenderer::new());
+    let video = Arc::new(MockVideo::new());
+    let opts = DaemonOptions {
+        paths,
+        project_dir: proj,
+        restore_on_start: false,
+        enable_niri: false,
+        enable_settings_watch: false,
+    };
+    let mut daemon = DaemonInstance::start_with_backends(
+        opts,
+        Arc::clone(&renderer) as Arc<dyn RendererBackend>,
+        Arc::clone(&video) as Arc<dyn VideoBackend>,
+    )
+    .expect("start daemon");
+    let client = IpcClient::new(daemon.socket_path());
+
+    // In video mode, ClearCache trims renderer scratch state without stopping the live video player.
+    let resp = client
+        .call(&Request::ApplyVideo {
+            mode: Some(VideoModeAction::Normal),
+            path: Some(vid.clone()),
+            backdrop: BackdropOverride::Auto,
+        })
+        .unwrap();
+    assert!(resp.ok, "{:?}", resp.error);
+
+    let clear_vid = client.call(&Request::ClearCache).unwrap();
+    assert!(clear_vid.ok);
+    match clear_vid.data {
+        Some(ResponseData::CacheCleared(report)) => assert!(!report.video_backend_stopped),
+        other => panic!("unexpected response: {other:?}"),
+    }
+    assert_eq!(video.shutdown_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(renderer.trim_calls.load(Ordering::Relaxed), 1);
+
+    // After switching back to static, ClearCache shuts down the idle video backend and trims renderer.
+    let resp = client
+        .call(&Request::ApplyStatic {
+            path: img,
+            mode: None,
+            instant: true,
+            backdrop: BackdropOverride::Auto,
+        })
+        .unwrap();
+    assert!(resp.ok, "{:?}", resp.error);
+
+    let clear_static = client.call(&Request::ClearCache).unwrap();
+    assert!(clear_static.ok);
+    match clear_static.data {
+        Some(ResponseData::CacheCleared(report)) => assert!(report.video_backend_stopped),
+        other => panic!("unexpected response: {other:?}"),
+    }
+    assert_eq!(video.shutdown_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(renderer.trim_calls.load(Ordering::Relaxed), 2);
+    daemon.shutdown();
+}
+
+#[test]
+fn clear_cache_disk_clears_caches_and_preserves_simple_swaybg_blur() {
+    let tmp = TempDir::new("clear_cache_disk");
+    let root = tmp.path();
+    let proj = root.join("project");
+    fs::create_dir_all(&proj).unwrap();
+
+    let cache_dir = root.join("cache/bgpicker");
+    let state_dir = root.join("state/bgpicker");
+    let home_dir = root.join("home");
+    fs::create_dir_all(cache_dir.join("video-blur")).unwrap();
+    fs::create_dir_all(cache_dir.join("image-thumbnails")).unwrap();
+    fs::create_dir_all(cache_dir.join("video-thumbnails")).unwrap();
+    fs::create_dir_all(cache_dir.join("blur")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::create_dir_all(home_dir.join(".cache")).unwrap();
+
+    let active_blur = cache_dir.join("blur/active.png");
+    let stale_blur = cache_dir.join("blur/stale.png");
+    fs::write(&active_blur, vec![1u8; 4096]).unwrap();
+    fs::write(&stale_blur, vec![2u8; 4096]).unwrap();
+    fs::write(cache_dir.join("video-blur/old.mp4"), vec![3u8; 8192]).unwrap();
+    fs::write(cache_dir.join("image-thumbnails/img.jpg"), vec![4u8; 2048]).unwrap();
+    fs::write(cache_dir.join("video-thumbnails/vid.jpg"), vec![5u8; 2048]).unwrap();
+    fs::write(cache_dir.join("daemon.log"), vec![b'x'; 1024]).unwrap();
+
+    // Mark simple engine with active current_swaybg_img pointer.
+    fs::write(state_dir.join("engine"), "simple\n").unwrap();
+    fs::write(
+        home_dir.join(".cache/current_swaybg_img"),
+        format!("{}\n", active_blur.display()),
+    )
+    .unwrap();
+
+    let ctl_bin = env!("CARGO_BIN_EXE_bgpickerctl");
+    let sock = root.join("run/nonexistent.sock");
+    let out = Command::new(ctl_bin)
+        .args([
+            "--socket",
+            sock.to_str().unwrap(),
+            "--project-dir",
+            proj.to_str().unwrap(),
+            "clear-cache",
+            "--disk",
+        ])
+        .env("HOME", &home_dir)
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .output()
+        .expect("run bgpickerctl clear-cache --disk");
+
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(active_blur.exists(), "active simple-mode blur must be preserved");
+    assert!(!stale_blur.exists());
+    assert!(!cache_dir.join("video-blur/old.mp4").exists());
+    assert!(!cache_dir.join("image-thumbnails/img.jpg").exists());
+    assert!(!cache_dir.join("video-thumbnails/vid.jpg").exists());
+    assert_eq!(fs::metadata(cache_dir.join("daemon.log")).unwrap().len(), 0);
 }

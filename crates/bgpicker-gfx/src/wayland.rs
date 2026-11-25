@@ -110,6 +110,7 @@ pub enum RenderCommand {
         parallax: ParallaxSettings,
         kawase: KawaseSettings,
     },
+    TrimIdle,
     Clear,
     Shutdown,
 }
@@ -736,6 +737,16 @@ impl WaylandApp {
                     out.wallpaper.pipeline.mark_dirty();
                     if let Some(ref mut b) = out.backdrop {
                         b.pipeline.mark_dirty();
+                    }
+                }
+            }
+            RenderCommand::TrimIdle => {
+                self.active.wallpaper_frame = None;
+                self.active.backdrop_frame = None;
+                for out in &mut self.outputs {
+                    out.wallpaper.pipeline.trim_idle(&self.egl.gl);
+                    if let Some(ref mut b) = out.backdrop {
+                        b.pipeline.trim_idle(&self.egl.gl);
                     }
                 }
             }

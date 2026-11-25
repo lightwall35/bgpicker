@@ -21,8 +21,8 @@ use bgpicker_core::paths::{
     WallpaperMode,
 };
 use bgpicker_core::protocol::{
-    BackdropAction, BackdropOverride, DaemonStatus, EngineAction, ModeAction, OutputStatus,
-    Request, Response, ResponseData, VideoModeAction,
+    BackdropAction, BackdropOverride, ClearCacheReport, DaemonStatus, EngineAction, ModeAction,
+    OutputStatus, Request, Response, ResponseData, VideoModeAction,
 };
 use bgpicker_gfx::{KawaseSettings, LayerTargets, TransitionSpec};
 
@@ -473,6 +473,10 @@ impl ActorRunner {
                     Err(e) => Response::err(e.to_string()),
                 }
             }
+            Request::ClearCache => match self.cmd_clear_cache() {
+                Ok(report) => Response::ok(ResponseData::CacheCleared(report)),
+                Err(e) => Response::err(e),
+            },
             // Handled synchronously before actor queue, kept exhaustive for safety.
             Request::Ping => Response::ok(ResponseData::Pong),
             Request::Status
@@ -966,7 +970,52 @@ impl ActorRunner {
             }
         }
     }
+
+    fn cmd_clear_cache(&mut self) -> Result<ClearCacheReport, String> {
+        let (rss_before_kib, pss_before_kib) = read_self_smaps_kib();
+        let video_backend_stopped = self.state.engine != EngineKind::Video;
+        if video_backend_stopped {
+            self.video.shutdown();
+        }
+        self.renderer.trim_idle()?;
+        trim_process_heap();
+        let (rss_after_kib, pss_after_kib) = read_self_smaps_kib();
+        Ok(ClearCacheReport {
+            rss_before_kib,
+            rss_after_kib,
+            pss_before_kib,
+            pss_after_kib,
+            video_backend_stopped,
+        })
+    }
 }
+
+fn read_self_smaps_kib() -> (u64, u64) {
+    let Ok(text) = fs::read_to_string("/proc/self/smaps_rollup") else {
+        return (0, 0);
+    };
+    let mut rss = 0u64;
+    let mut pss = 0u64;
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        match (parts.next(), parts.next()) {
+            (Some("Rss:"), Some(v)) => rss = v.parse().unwrap_or(0),
+            (Some("Pss:"), Some(v)) => pss = v.parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    (rss, pss)
+}
+
+#[cfg(target_env = "gnu")]
+fn trim_process_heap() {
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(target_env = "gnu"))]
+fn trim_process_heap() {}
 
 fn backdrop_from_bool(on: bool) -> BackdropParallax {
     if on {
