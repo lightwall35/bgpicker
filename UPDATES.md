@@ -1,9 +1,9 @@
 # BgPicker 更新记录与 Beta 优化规划
 
-记录日期：2026-11-17  
-当前基线分支：`quickshell-standalone`（准备切出 `beta` 分支进行下一阶段优化）
+记录日期：2026-11-25（最初创建于 2026-11-17）  
+当前默认分支：`rust`（包含原 `quickshell-standalone`、`beta` 及统一 Rust 守护进程架构演进）
 
-本文档整理了自接手项目以来已经完成并验证的改进，以及针对当前内存、GPU 与进程架构瓶颈制定的 `beta` 分支优化路线图。
+本文档记录项目自 `quickshell-standalone` 以来在面板精简、`beta` 性能调优、GPU 实时 Dual-Kawase 模糊替换，直至 `rust` 分支统一守护进程重写的完整演进历程。
 
 ---
 
@@ -142,3 +142,50 @@
 - Python 单元测试（`python3 -m unittest discover -s tests -q`）：57 项全部通过。
 - 离线 QML 测试（`qmltestrunner -input tests/qml`）：21 项全部通过。
 - `qmllint` 检查全部修改及新增 QML 文件：退出码 0。
+
+---
+
+## 五、`beta` 后续架构精简与视差衔接修复（`c180f28`、`c49dcde`）
+
+在 `beta` 分支验证并落地的两项关键结构优化：
+
+1. **单解码器视频分流与 3-pass Dual-Kawase GPU 模糊（`c180f28`，2026-11-19）**
+   - 移除 `video_wallpaper.py prepare_blur()` 的 1080p 30fps CRF 18 离线预模糊 MP4 转码及第二套并行 `MediaPlayer`。
+   - 新增原生 Qt 插件 `BgPickerVideo`（`native/VideoFrameSplitter.cpp`）和 `VideoMirrorSlot.qml`、`DualKawaseBlur.qml` 与 `shaders/kawase-{down,up}.frag(.qsb)`：单路视频解码后零拷贝向概览层分发帧信号，并利用 3-pass Dual-Kawase 模糊着色器在 GPU 端实时模糊，概览关闭时冻结更新以节省渲染开销。
+   - **修复**：切换视频时不再重走耗时数秒的离线 FFmpeg 模糊转码，双端视频内存和解码占用大幅下降。
+
+2. **静态视差切回普通模式（`parallax -> awww`）平滑衔接（`c49dcde`，2026-11-25）**
+   - 在 `ParallaxWallpaper.qml` 增加 `modeExiting` 状态，在 `switch_wallpaper.sh` 中等待 `exitMode` 完成并经 `await_mode_transition` 确认后再启动 `awww-daemon` 与重置透明遮罩。
+   - 修复了从视差切回 `awww` 时先启动守护进程或过早清屏导致的黑闪／居中画面跳变。
+
+---
+
+## 六、`rust` 分支：统一守护进程与 EGL/FFmpeg 渲染重写（`e81555f`，2026-11-25）
+
+为彻底消除多进程 QtQuick + `awww-daemon` + Python IPC 的显存、内存峰值与跨表面竞争，新增 `rust` 分支，将壁纸与视频引擎重写为 4 个 Rust crate，并完整保留原有 QML 轮播交互体验。
+
+### 1. 四层 Rust Workspace 架构
+
+- **`crates/bgpicker-core`**：统一 XDG 路径与原子持久化（`PersistedState`）、`settings.json` 解析与随机效果解析、niri IPC 工作区／焦点列／概览状态监听（`NiriWatcher`）、视差几何与过渡数学模型、守护进程 UNIX socket JSON 协议与媒体目录/缩略图生成器。
+- **`crates/bgpicker-gfx`**：基于 `smithay-client-toolkit` + `wayland-egl` + `glow`（OpenGL ES）直接接管每个输出上的 `bgpicker:wallpaper`（桌面背景层）与 `bgpicker:backdrop`（niri 概览背景层）两块 Wayland layer-shell 表面：
+  - 将静态图与视频帧的 `fade`、`wipe`、`wave`、`grow`、`outer` 换图着色器统一进 `LayerPipeline`。
+  - 在同一 EGL 表面内插值 `mode_blend` 完成 `awww`（居中填充）与 `parallax`（列视差）的平滑切换，彻底消除外部 `awww` 进程的表面创建与 Z 序竞争。
+  - **图像空间缓存 Dual-Kawase 模糊（`DualKawaseBlur`）**：对静态图以源图像空间（上限 `1920×1080` 比例缩放）离线化算一遍 3-pass FBO 金字塔并在内存缓存在当前贴图周期；视差平移时按裁剪坐标采样已模糊纹理，消除了屏幕空间实时采样随窗口列平移产生的边缘闪烁问题。对视频帧仅在 `overview_open` 为真或新视频首 4 帧预热期刷新模糊链，概览关闭时节省 GPU 开销。
+- **`crates/bgpicker-video`**：通过 FFmpeg C FFI（`crates/bgpicker-video/ffi/ffmpeg_shim.c`）与后台解码线程（`worker.rs`）结合三缓冲队列直接向渲染器推送视频帧，支持自动探测硬件加速并安全回退软解、帧步调控制、新旧流无缝过渡以及后台预热。
+- **`crates/bgpicker-daemon`**：序列化状态机 `DaemonActor`、`bgpicker-daemon`、`bgpickerctl` 客户端与 `inotify` 配置监听：
+  - `simple` 模式仍按极简思路使用两个 `swaybg`（本地副本 `swaybg-front` 配合 `bgpick-fg` namespace + 概览 `^wallpaper$`），进入时自动退出 `qs` 与 `bgpicker-daemon`；退出 `simple` 模式时先由守护进程提交首帧再安全撤下 `swaybg`。
+  - 完整／视频模式下，支持前／后景视差默认同步（`BackdropOverride::Auto`）与独立覆盖控制（`--keep-backdrop`、`--backdrop <on|off|keep>`、`backdrop-parallax [on|off|toggle]`）。
+  - **动画帧时间锚点修复**：`render_due()` 在表面空闲期不累积 `last_tick`，切换或列移动触发首帧动画前按当前时间重置基准，防止空闲时长被计入第 0 帧导致静态壁纸视差跳变。
+  - 保持后台异步生成 `~/.cache/bgpicker/blur/*` 与 `~/.cache/current_swaybg_img`，兼容锁屏等外部组件。
+
+### 2. 前端保留与包装脚本兼容
+
+- 完整保留 `Carousel.qml`、`CarouselMedia.js`、`SkewSelector.qml` 的外观、手势与 165Hz 动画逻辑；精简 `BgPicker.qml` 与 `shell.qml`，通过 `bgpickerctl` 与守护进程通信。
+- 保留 `bgpicker.sh`、`wallpaper_engine.sh`、`switch_wallpaper.sh`、`picker_action.sh`、`backdrop_parallax.sh`、`backdrop_awww.sh` 对外命令行接口并转发到 `bgpickerctl`；`simple_wallpaper.sh` 继续服务简洁双 `swaybg` 模式。
+
+### 3. `rust` 分支验证状态
+
+- `cargo clippy --workspace --all-targets -- -D warnings`：零警告通过。
+- `cargo test --workspace`：54 项全部通过（覆盖 `bgpicker-core`、`bgpicker-gfx`、`bgpicker-video`、`bgpicker-daemon`）。
+- `cargo build --release`：构建成功（`target/release/bgpicker-daemon`、`target/release/bgpickerctl`）。
+- Shell 语法检查（`bash -n`）、Python 单元测试（`python3 -m unittest`）、离线 QML 测试（`qmltestrunner -input tests/qml`）均全部通过。
