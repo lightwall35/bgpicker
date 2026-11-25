@@ -40,6 +40,7 @@ Item {
             property bool shaderFailed: false
             property int lastShaderStatus: 0
             property real modeBlend: 1
+            property bool modeExiting: false
             readonly property bool modeTransitionRunning: modeAnimation.running
             readonly property real progress: WallpaperMath.progress(root.backend.niriState, modelData.name, root.backend.settings.columnSpan)
 
@@ -76,6 +77,7 @@ Item {
             }
             function stage(path) {
                 finishTransition();
+                modeExiting = false;
                 stagedPath = path;
                 autoCommit = false;
                 shaderFailed = false;
@@ -116,6 +118,7 @@ Item {
             function animateMode(target) {
                 finishTransition();
                 modeAnimation.stop();
+                modeExiting = target === "exit";
                 modeAnimation.from = target === "enter" ? 0 : modeBlend;
                 modeAnimation.to = target === "enter" ? 1 : 0;
                 modeBlend = modeAnimation.from;
@@ -124,6 +127,7 @@ Item {
             }
             function cancelModeTransition() {
                 modeAnimation.stop();
+                modeExiting = false;
                 modeBlend = 1;
             }
             function imageLoaded() {
@@ -137,7 +141,7 @@ Item {
                 id: canvas
                 anchors.fill: parent
                 clip: true
-                opacity: view.modeBlend
+                opacity: view.modeExiting ? 1 : view.modeBlend
                 readonly property bool useShader: view.transitionActive && Transitions.kind(view.transitionSpec.type) > 0 && GraphicsInfo.api !== GraphicsInfo.Software && !view.shaderFailed
 
                 // A single per-screen progress animation drives both images,

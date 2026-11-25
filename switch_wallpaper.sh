@@ -299,15 +299,28 @@ if [[ "$MODE" == parallax ]]; then
     fi
     STAGED=false
 else
-    ensure_awww_daemon
     BACKDROP_TOUCHED=true
     apply_backdrop &
     BACKDROP_PID=$!
     MAIN_RESULT=0
+    if $SMOOTH_EXIT; then
+        RESULT="$(backend exitMode)"
+        [[ "$RESULT" == started ]] || { wait "$BACKDROP_PID" >/dev/null 2>&1 || true; echo "BgPicker: $RESULT" >&2; exit 1; }
+        MODE_EXIT_STARTED=true
+        await_mode_transition || { wait "$BACKDROP_PID" >/dev/null 2>&1 || true; exit 1; }
+    fi
+    ensure_awww_daemon || { wait "$BACKDROP_PID" >/dev/null 2>&1 || true; exit 1; }
     if $RESTORE; then
         await_awww_startup || MAIN_RESULT=$?
     elif $SMOOTH_EXIT; then
-        awww img "$ORIGINAL" --transition-type none 9>&- || MAIN_RESULT=$?
+        if [[ "$ORIGINAL" == "$PREVIOUS_ORIGINAL" ]]; then
+            awww img "$ORIGINAL" --transition-type none 9>&- || MAIN_RESULT=$?
+        else
+            awww img "$ORIGINAL" "${TRANSITION_ARGS[@]}" 9>&- || MAIN_RESULT=$?
+        fi
+        if [[ "$MAIN_RESULT" == 0 ]]; then
+            await_awww_image || MAIN_RESULT=$?
+        fi
     else
         awww img "$ORIGINAL" "${TRANSITION_ARGS[@]}" 9>&- || MAIN_RESULT=$?
         if $HANDOFF && [[ "$MAIN_RESULT" == 0 ]]; then
@@ -317,13 +330,7 @@ else
     [[ "$MAIN_RESULT" == 0 ]] && MAIN_CHANGED=true
     wait "$BACKDROP_PID" || { echo "BgPicker: backdrop update failed" >&2; exit 1; }
     [[ "$MAIN_RESULT" == 0 ]] || exit "$MAIN_RESULT"
-    if $SMOOTH_EXIT; then
-        await_awww_image
-        RESULT="$(backend exitMode)"
-        [[ "$RESULT" == started ]] || { echo "BgPicker: $RESULT" >&2; exit 1; }
-        MODE_EXIT_STARTED=true
-        await_mode_transition
-    fi
+    if $SMOOTH_EXIT; then sleep 0.05; fi
     # Keep parallax visible until awww has accepted the restored image.
     # Plain command-line use still works without a running picker.
     RESULT="$(backend deactivate 2>/dev/null)" || RESULT=""
