@@ -190,3 +190,23 @@
 - `cargo build --release`：构建成功（`target/release/bgpicker-daemon`、`target/release/bgpickerctl`）。
 - Shell 语法检查（`bash -n`）、Python 单元测试（`python3 -m unittest`）、离线 QML 测试（`qmltestrunner -input tests/qml`）均全部通过。
 - 新增 `bgpickerctl clear-cache`（及 `./bgpicker.sh clear-cache` / `trim`）与 `./bgpicker_stats.sh`：静态模式下支持按需关闭空闲视频后端、释放 `DualKawaseBlur` 中间 FBO 与 CPU 帧缓冲、调用 `malloc_trim(0)` 回收堆内存，并支持 `--deep`、`--picker`、`--disk` 分级清理与人类可读资源占用快照。
+
+---
+
+## 七、纯 Rust 按需选择器重构与动效升级（2026-11-27）
+
+将常驻 Quickshell 选择器面板重构为纯 Rust 按需 Wayland 覆盖层二进制 **`bgpicker-picker`**（`crates/bgpicker-picker`），实现空闲 **0 MiB** 驻留与完整原生体验，并同步修复跨引擎视差过渡瑕疵：
+
+1. **纯 Rust 原生覆盖层面板（`crates/bgpicker-picker`）**：
+   - 基于 `smithay-client-toolkit`（`zwlr_layer_shell_v1` `Overlay` + `wp_fractional_scale_v1` + `wp_viewporter` + `xkbcommon`）+ EGL/GLES 3.0 单通道 SDF 圆角倾斜卡片与底部胶囊渲染器，完整复刻双页倾斜轮播、1.5s 长按原图放大预览、底部普通/视差及 7 种切换效果控件。
+   - 采用惰性零拷贝 `swash` + `mmap` HiDPI 中英文字形图集与有界异步 LRU 缩略图缓存，展开期实测约 `44.5 MiB Private / 102.7 MiB PSS / 89 MiB VRAM`，冷启动约 `199 ms`，关闭后完整释放进程与显存回落至 **0 MiB**；`BGPICKER_USE_QS=1` 仍保留旧版 Quickshell 回退路径。
+   - `bgpicker-core` 与 `bgpicker-daemon` 新增 `focused_output` 跟踪、`bgpickerctl picker [toggle|open|close|next|prev]` 与单实例按需拉起；`bgpicker.sh`、`wallpaper_engine.sh`、`bgpicker_stats.sh` 全面适配按需面板。
+2. **交互打磨与跨引擎体验修复**：
+   - 新增鼠标左键左右拖动与速度惯性轻甩选图（含边缘橡皮筋与循环包裹回弹）；引入解析临界阻尼弹簧 `SmoothSpring` 与连续 `scroll_index` 衰减，彻底消除未展开卡片在指针悬停切换时的尺寸跳变。
+   - 修复视频壁纸下打开面板默认停在静态页导致点选普通/视差误切回静态图片的问题：面板打开时自动同步 `DaemonStatus.engine`（视频引擎直达视频页，静态引擎停在静态页）。
+   - 修复静态与视频壁纸在普通/视差不同模式间互切时的“先硬平移再转场”问题：`bgpicker-gfx` 的 `LayerPipeline` 新增 `old_mode_blend` 冻结过渡期旧画面几何，`RenderCommand::ApplyFrame` 携带 `FrameModeTargets` 原子更新目标模式，彻底消除预跳变。
+3. **面板与搜索框开关动画升级**：
+   - 面板打开（`240ms OutCubic`）与关闭（`180ms OutCubic`）增加整体卡片空间缩放、微幅上浮/下沉、底部控件柔和滑入滑出，以及确认换图时的全界面平滑溶解，并将时钟锚定在首帧 `configure`；关闭过程支持 `Mod+N` 中途无缝打断反向弹回。
+   - 顶部 `Ctrl+F` 搜索框升级为 `220ms` 滑入缩放淡入与 `160ms` 滑出淡出（关闭瞬间停止拦截输入并保留文字快照避免闪出占位提示）。
+4. **验证状态**：
+   - `cargo clippy --workspace --all-targets -- -D warnings` 零警告通过；`cargo test --workspace` 全工作区测试通过；`cargo build --release`、`bash -n` 及 Python 单元测试（42 项）全部通过，并在 `niri` Wayland 桌面实测生效。
