@@ -2,11 +2,15 @@
 # ==============================================================================
 # Script Name: bgpicker.sh
 # Description: Compatibility CLI wrapper for bgpicker-daemon / bgpickerctl and
-#              the Quickshell Carousel picker overlay.
+#              the native bgpicker-picker overlay (with optional legacy qs).
 # ==============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+use_qs_picker() {
+    [[ "${BGPICKER_USE_QS:-}" == "1" ]]
+}
 
 resolve_bgpickerctl() {
     local dir="${1:-$SCRIPT_DIR}"
@@ -28,8 +32,8 @@ resolve_bgpickerctl() {
         return 0
     fi
     if command -v cargo >/dev/null 2>&1 && [[ -f "$dir/Cargo.toml" ]]; then
-        echo "BgPicker: building bgpickerctl (release)..." >&2
-        cargo build --release -p bgpicker-daemon --manifest-path "$dir/Cargo.toml" >&2
+        echo "BgPicker: building bgpickerctl and bgpicker-picker (release)..." >&2
+        cargo build --release -p bgpicker-daemon -p bgpicker-picker --manifest-path "$dir/Cargo.toml" >&2
         if [[ -x "$dir/target/release/bgpickerctl" ]]; then
             printf '%s\n' "$dir/target/release/bgpickerctl"
             return 0
@@ -40,7 +44,7 @@ resolve_bgpickerctl() {
 }
 
 is_qs_running() {
-    qs ipc -p "$SCRIPT_DIR" show &>/dev/null
+    command -v qs >/dev/null 2>&1 && qs ipc -p "$SCRIPT_DIR" show &>/dev/null
 }
 
 start_qs() {
@@ -97,11 +101,15 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                     else
                         "$CTL" apply-video "$2"
                     fi
-                    start_qs >/dev/null 2>&1 || true
+                    if use_qs_picker; then
+                        start_qs >/dev/null 2>&1 || true
+                    fi
                     ;;
                 next)
                     "$CTL" video next
-                    start_qs >/dev/null 2>&1 || true
+                    if use_qs_picker; then
+                        start_qs >/dev/null 2>&1 || true
+                    fi
                     ;;
                 *)
                     echo "Usage: $0 video [status|normal|parallax [file]|next]" >&2
@@ -111,30 +119,54 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
             ;;
         start)
             "$CTL" start
-            start_qs
+            if use_qs_picker; then
+                start_qs
+            fi
             ;;
         stop)
-            stop_qs
+            if is_qs_running; then
+                stop_qs || true
+            fi
             exec "$CTL" stop
             ;;
         toggle)
-            "$CTL" start >/dev/null 2>&1 || true
-            send_ipc "toggle"
+            if use_qs_picker; then
+                "$CTL" start >/dev/null 2>&1 || true
+                send_ipc "toggle"
+            else
+                exec "$CTL" picker toggle
+            fi
             ;;
         open)
-            "$CTL" start >/dev/null 2>&1 || true
-            send_ipc "open"
+            if use_qs_picker; then
+                "$CTL" start >/dev/null 2>&1 || true
+                send_ipc "open"
+            else
+                exec "$CTL" picker open
+            fi
             ;;
         close)
-            send_ipc "close"
+            if use_qs_picker; then
+                send_ipc "close"
+            else
+                exec "$CTL" picker close
+            fi
             ;;
         next)
-            "$CTL" start >/dev/null 2>&1 || true
-            send_ipc "cycleNext"
+            if use_qs_picker; then
+                "$CTL" start >/dev/null 2>&1 || true
+                send_ipc "cycleNext"
+            else
+                exec "$CTL" picker next
+            fi
             ;;
         prev)
-            "$CTL" start >/dev/null 2>&1 || true
-            send_ipc "cyclePrevious"
+            if use_qs_picker; then
+                "$CTL" start >/dev/null 2>&1 || true
+                send_ipc "cyclePrevious"
+            else
+                exec "$CTL" picker prev
+            fi
             ;;
         mode)
             if [[ $# -eq 1 ]]; then

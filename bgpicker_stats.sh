@@ -52,7 +52,7 @@ def format_mib(mib: int | None) -> str:
 
 
 def find_bgpicker_pids() -> list[tuple[int, str]]:
-    """Locate live bgpicker-daemon, project Quickshell, and simple-mode swaybg PIDs."""
+    """Locate live bgpicker-daemon, bgpicker-picker, legacy Quickshell, and simple-mode swaybg PIDs."""
     found: dict[int, str] = {}
     proj_str = str(PROJECT_DIR)
 
@@ -91,6 +91,8 @@ def find_bgpicker_pids() -> list[tuple[int, str]]:
 
         if exe_name == "bgpicker-daemon":
             found[pid] = "bgpicker-daemon"
+        elif exe_name == "bgpicker-picker":
+            found[pid] = "bgpicker-picker"
         elif exe_name == "qs":
             # Match only the Quickshell instance rooted at this bgpicker project directory.
             for idx, arg in enumerate(args):
@@ -103,7 +105,13 @@ def find_bgpicker_pids() -> list[tuple[int, str]]:
                             found[pid] = "qs (picker)"
                     break
 
-    order = {"bgpicker-daemon": 0, "qs (picker)": 1, "swaybg-front": 2, "swaybg-back": 3}
+    order = {
+        "bgpicker-daemon": 0,
+        "bgpicker-picker": 1,
+        "qs (picker)": 2,
+        "swaybg-front": 3,
+        "swaybg-back": 4,
+    }
     return sorted(found.items(), key=lambda item: (order.get(item[1], 99), item[0]))
 
 
@@ -217,7 +225,7 @@ def collect_and_print(sample_sec: float) -> None:
         print(f"状态: {summary}")
 
     if not procs:
-        print("未检测到正在运行的 bgpicker-daemon、项目 qs 或 simple swaybg 进程。")
+        print("未检测到正在运行的 bgpicker-daemon、bgpicker-picker、项目 qs 或 simple swaybg 进程。")
         return
 
     t0 = time.monotonic()

@@ -208,12 +208,29 @@ pub struct NiriState {
     pub workspaces: Vec<Workspace>,
     pub last_columns: HashMap<u64, i64>,
     pub overview_open: bool,
+    #[serde(default)]
+    pub focused_output: Option<String>,
 }
 
 impl NiriState {
     /// Returns a fresh empty state matching `WallpaperMath.initialState()`.
     pub fn initial() -> Self {
         Self::default()
+    }
+
+    fn derive_focused_output(workspaces: &[Workspace], windows: &[Window]) -> Option<String> {
+        workspaces
+            .iter()
+            .find(|ws| ws.is_focused)
+            .and_then(|ws| ws.output.clone())
+            .or_else(|| {
+                windows
+                    .iter()
+                    .find(|w| w.is_focused)
+                    .and_then(|w| w.workspace_id)
+                    .and_then(|ws_id| workspaces.iter().find(|ws| ws.id == ws_id))
+                    .and_then(|ws| ws.output.clone())
+            })
     }
 
     /// Returns the scrolling column index of a tiled window, or `None` if floating/unplaced.
@@ -241,6 +258,7 @@ impl NiriState {
                     workspaces,
                     last_columns: self.last_columns.clone(),
                     overview_open: is_open,
+                    focused_output: self.focused_output.clone(),
                 };
             }
             NiriEvent::WorkspacesChanged {
@@ -281,19 +299,40 @@ impl NiriState {
             }
             NiriEvent::WindowOpenedOrChanged { window: changed } => {
                 windows.retain(|w| w.id != changed.id);
-                if changed.is_focused {
+                let focused_ws_id = if changed.is_focused {
                     for w in &mut windows {
                         w.is_focused = false;
                     }
-                }
+                    changed.workspace_id
+                } else {
+                    None
+                };
                 windows.push(changed);
+                if let Some(ws_id) = focused_ws_id {
+                    if workspaces.iter().any(|ws| ws.id == ws_id) {
+                        for ws in &mut workspaces {
+                            ws.is_focused = ws.id == ws_id;
+                        }
+                    }
+                }
             }
             NiriEvent::WindowClosed { id } => {
                 windows.retain(|w| w.id != id);
             }
             NiriEvent::WindowFocusChanged { id } => {
+                let mut focused_ws_id = None;
                 for w in &mut windows {
                     w.is_focused = Some(w.id) == id;
+                    if w.is_focused {
+                        focused_ws_id = w.workspace_id;
+                    }
+                }
+                if let Some(ws_id) = focused_ws_id {
+                    if workspaces.iter().any(|ws| ws.id == ws_id) {
+                        for ws in &mut workspaces {
+                            ws.is_focused = ws.id == ws_id;
+                        }
+                    }
                 }
             }
             NiriEvent::WindowLayoutsChanged { changes } => {
@@ -324,11 +363,14 @@ impl NiriState {
             }
         }
 
+        let focused_output = Self::derive_focused_output(&workspaces, &windows);
+
         Self {
             windows,
             workspaces,
             last_columns: memory,
             overview_open,
+            focused_output,
         }
     }
 

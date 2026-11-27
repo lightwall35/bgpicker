@@ -2,8 +2,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bgpicker_gfx::{
-    FrameInput, LayerRole, LayerTargets, RenderCommand, TransitionEffect, TransitionSpec,
-    WaylandRenderer,
+    FrameInput, FrameModeTargets, LayerRole, LayerTargets, RenderCommand, TransitionEffect,
+    TransitionSpec, WaylandRenderer,
 };
 
 fn make_solid_frame(key: &str, rgba: [u8; 4]) -> FrameInput {
@@ -91,6 +91,7 @@ fn idle_animations_start_at_frame_zero_after_long_idle() {
             frame: frame_a,
             transition: TransitionSpec::instant(),
             targets: LayerTargets::Both,
+            modes: FrameModeTargets::default(),
         })
         .unwrap();
     handle
@@ -199,6 +200,7 @@ fn idle_animations_start_at_frame_zero_after_long_idle() {
                 ..TransitionSpec::default()
             },
             targets: LayerTargets::Both,
+            modes: FrameModeTargets::default(),
         })
         .unwrap();
     renderer.step(Some(Duration::from_millis(20))).unwrap();

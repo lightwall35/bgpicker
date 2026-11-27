@@ -83,6 +83,7 @@ pub struct LayerPipeline {
     progress_anim: Option<ScalarAnim>,
 
     mode_blend: f32,
+    old_mode_blend: f32,
     mode_anim: Option<ScalarAnim>,
 
     blur: Option<DualKawaseBlur>,
@@ -105,6 +106,7 @@ impl LayerPipeline {
             animated_progress: 0.5,
             progress_anim: None,
             mode_blend: initial_blend,
+            old_mode_blend: initial_blend,
             mode_anim: None,
             blur: (role == LayerRole::Backdrop).then(DualKawaseBlur::new),
             needs_redraw: false,
@@ -124,6 +126,11 @@ impl LayerPipeline {
     #[inline]
     pub fn mode_blend(&self) -> f32 {
         self.mode_blend
+    }
+
+    #[inline]
+    pub fn old_mode_blend(&self) -> f32 {
+        self.old_mode_blend
     }
 
     #[inline]
@@ -177,9 +184,15 @@ impl LayerPipeline {
         Ok(())
     }
 
-    /// Commits the previously staged slot as the new front slot and begins `spec`
-    /// if a previous texture was already presented.
-    pub fn commit_staged(&mut self, gl: &glow::Context, spec: TransitionSpec) -> bool {
+    /// Commits the previously staged slot as the new front slot, atomically applying an
+    /// optional target parallax mode for the incoming frame while preserving the outgoing
+    /// frame's current `mode_blend` for the duration of the transition.
+    pub fn commit_staged_with_mode(
+        &mut self,
+        gl: &glow::Context,
+        spec: TransitionSpec,
+        next_parallax: Option<bool>,
+    ) -> bool {
         let Some(next_idx) = self.staged_slot.take() else {
             return false;
         };
@@ -187,18 +200,46 @@ impl LayerPipeline {
             return false;
         }
         let had_previous = self.front_index.is_some();
+        let prev_blend = self.mode_blend;
+        if let Some(parallax) = next_parallax {
+            self.mode_anim = None;
+            self.mode_blend = if parallax { 1.0 } else { 0.0 };
+        }
         self.front_index = Some(next_idx);
         let spec = spec.clamped();
         self.transition_spec = spec;
         if had_previous && spec.effect != TransitionEffect::None && spec.duration_ms > 0 {
+            self.old_mode_blend = prev_blend;
             self.transition_active = true;
             self.transition_elapsed_s = 0.0;
             self.transition_progress = 0.0;
         } else {
+            self.old_mode_blend = self.mode_blend;
             self.finish_transition(gl);
         }
         self.needs_redraw = true;
         true
+    }
+
+    /// Commits the previously staged slot as the new front slot and begins `spec`
+    /// if a previous texture was already presented.
+    pub fn commit_staged(&mut self, gl: &glow::Context, spec: TransitionSpec) -> bool {
+        self.commit_staged_with_mode(gl, spec, None)
+    }
+
+    /// Convenience helper that stages and immediately commits `frame` with `spec`
+    /// and an optional atomic target parallax mode.
+    pub fn apply_frame_with_mode(
+        &mut self,
+        gl: &glow::Context,
+        frame: &FrameInput,
+        spec: TransitionSpec,
+        next_parallax: Option<bool>,
+        bgra_ext_supported: bool,
+    ) -> Result<()> {
+        self.stage_frame(gl, frame, bgra_ext_supported)?;
+        self.commit_staged_with_mode(gl, spec, next_parallax);
+        Ok(())
     }
 
     /// Convenience helper that stages and immediately commits `frame` with `spec`.
@@ -209,9 +250,7 @@ impl LayerPipeline {
         spec: TransitionSpec,
         bgra_ext_supported: bool,
     ) -> Result<()> {
-        self.stage_frame(gl, frame, bgra_ext_supported)?;
-        self.commit_staged(gl, spec);
-        Ok(())
+        self.apply_frame_with_mode(gl, frame, spec, None, bgra_ext_supported)
     }
 
     /// Streams a live video frame into whichever active slot matches `frame.media_key`
@@ -270,6 +309,9 @@ impl LayerPipeline {
         } else {
             self.mode_anim = None;
             self.mode_blend = target;
+            if !self.transition_active {
+                self.old_mode_blend = target;
+            }
         }
         self.needs_redraw = true;
     }
@@ -322,6 +364,9 @@ impl LayerPipeline {
         if let Some(mut anim) = self.mode_anim {
             let (val, done) = anim.advance(dt, ease_in_out_cubic);
             self.mode_blend = val;
+            if !self.transition_active {
+                self.old_mode_blend = val;
+            }
             self.mode_anim = if done { None } else { Some(anim) };
             self.needs_redraw = true;
         }
@@ -384,7 +429,12 @@ impl LayerPipeline {
         };
         let spec = self.transition_spec;
         let animated_progress = self.animated_progress;
-        let mode_blend = self.mode_blend;
+        let old_mode_blend = if has_old {
+            self.old_mode_blend
+        } else {
+            self.mode_blend
+        };
+        let new_mode_blend = self.mode_blend;
         let use_cached_blur = self.blur.is_some();
 
         let fw = w as f32;
@@ -396,7 +446,7 @@ impl LayerPipeline {
             old_slot.height as f32,
             zoom,
             animated_progress,
-            mode_blend,
+            old_mode_blend,
         );
         let new_geom = compute_mode_geometry(
             fw,
@@ -405,7 +455,7 @@ impl LayerPipeline {
             new_slot.height as f32,
             zoom,
             animated_progress,
-            mode_blend,
+            new_mode_blend,
         );
         let dir = spec.direction_vec();
         let p = &programs.transition;
@@ -464,6 +514,7 @@ impl LayerPipeline {
         self.transition_active = false;
         self.transition_progress = 1.0;
         self.transition_elapsed_s = 0.0;
+        self.old_mode_blend = self.mode_blend;
         if let Some(front) = self.front_index {
             let old = 1 - front;
             if self.staged_slot != Some(old) {
@@ -474,6 +525,7 @@ impl LayerPipeline {
 
     pub fn release_all(&mut self, gl: &glow::Context) {
         self.transition_active = false;
+        self.old_mode_blend = self.mode_blend;
         self.staged_slot = None;
         self.front_index = None;
         self.slots[0].release(gl);

@@ -5,4 +5,5 @@ members = [
     "crates/bgpicker-gfx",
     "crates/bgpicker-video",
     "crates/bgpicker-daemon",
+    "crates/bgpicker-picker",
 ]

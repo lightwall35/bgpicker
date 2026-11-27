@@ -11,7 +11,8 @@ use bgpicker_core::config::TransitionType;
 use bgpicker_core::paths::{atomic_write_text, BgPickerPaths, EngineKind, PersistedState};
 use bgpicker_core::protocol::{
     BackdropAction, BackdropOverride, ClearCacheReport, DaemonStatus, EngineAction, IpcClient,
-    ModeAction, Request, ResponseData, VideoModeAction,
+    ModeAction, PickerCommand, PickerIpcClient, ProtocolError, Request, ResponseData,
+    VideoModeAction,
 };
 
 use crate::actor::list_videos_sorted;
@@ -33,13 +34,32 @@ pub enum PickerAction {
 }
 
 impl PickerAction {
-    fn ipc_method(&self) -> &'static str {
+    fn qs_ipc_method(&self) -> &'static str {
         match self {
             Self::Toggle => "toggle",
             Self::Open => "open",
             Self::Close => "close",
             Self::Next => "cycleNext",
             Self::Prev => "cyclePrevious",
+        }
+    }
+
+    fn picker_command(&self) -> PickerCommand {
+        match self {
+            Self::Toggle => PickerCommand::Toggle,
+            Self::Open => PickerCommand::Open,
+            Self::Close => PickerCommand::Close,
+            Self::Next => PickerCommand::CycleNext,
+            Self::Prev => PickerCommand::CyclePrevious,
+        }
+    }
+
+    fn spawn_action_arg(&self) -> Option<&'static str> {
+        match self {
+            Self::Toggle | Self::Open => Some("open"),
+            Self::Next => Some("cycle-next"),
+            Self::Prev => Some("cycle-prev"),
+            Self::Close => None,
         }
     }
 }
@@ -643,6 +663,7 @@ pub fn execute(global: CtlGlobalOpts, cmd: CtlCommand) -> Result<Option<String>,
         CtlCommand::Startup => {
             let persisted = PersistedState::load(&paths);
             if persisted.engine == EngineKind::Simple {
+                close_picker_best_effort(&paths);
                 stop_quickshell_best_effort(&project_dir);
                 if let Some(wp) = persisted.current_wallpaper.filter(|p| p.is_file()) {
                     let canonical = fs::canonicalize(&wp).unwrap_or(wp);
@@ -656,6 +677,7 @@ pub fn execute(global: CtlGlobalOpts, cmd: CtlCommand) -> Result<Option<String>,
             Ok(None)
         }
         CtlCommand::Stop => {
+            close_picker_best_effort(&paths);
             stop_quickshell_best_effort(&project_dir);
             stop_simple_wallpaper_best_effort(&project_dir);
             if stop_daemon_if_live(&client)? {
@@ -877,6 +899,7 @@ pub fn execute(global: CtlGlobalOpts, cmd: CtlCommand) -> Result<Option<String>,
 
                 if target == EngineKind::Simple {
                     let wp = resolve_current_wallpaper(&client, &paths)?;
+                    close_picker_best_effort(&paths);
                     stop_quickshell_best_effort(&project_dir);
                     run_simple_wallpaper(&project_dir, &wp)?;
                     atomic_write_text(&paths.engine_file(), EngineKind::Simple.as_str())
@@ -950,23 +973,50 @@ pub fn execute(global: CtlGlobalOpts, cmd: CtlCommand) -> Result<Option<String>,
             Ok(Some(json))
         }
         CtlCommand::Picker { action } => {
-            ensure_daemon_live(&client, &paths, &project_dir, false)?;
-            ensure_quickshell_running(&project_dir)?;
-            let status = Command::new("qs")
-                .args([
-                    "ipc",
-                    "-p",
-                    &project_dir.to_string_lossy(),
-                    "call",
-                    "wallpaperCarousel",
-                    action.ipc_method(),
-                ])
-                .status()
-                .map_err(|e| format!("failed to execute qs ipc: {e}"))?;
-            if !status.success() {
-                return Err(format!("qs ipc exited with status {status}"));
+            if use_quickshell_picker() {
+                if !matches!(action, PickerAction::Close) {
+                    ensure_daemon_live(&client, &paths, &project_dir, false)?;
+                }
+                ensure_quickshell_running(&project_dir)?;
+                let status = Command::new("qs")
+                    .args([
+                        "ipc",
+                        "-p",
+                        &project_dir.to_string_lossy(),
+                        "call",
+                        "wallpaperCarousel",
+                        action.qs_ipc_method(),
+                    ])
+                    .status()
+                    .map_err(|e| format!("failed to execute qs ipc: {e}"))?;
+                if !status.success() {
+                    return Err(format!("qs ipc exited with status {status}"));
+                }
+                return Ok(None);
             }
-            Ok(None)
+
+            if !matches!(action, PickerAction::Close) {
+                ensure_daemon_live(&client, &paths, &project_dir, false)?;
+            }
+            let picker_client = PickerIpcClient::new(paths.picker_socket_path())
+                .with_timeout(Duration::from_millis(500));
+            match picker_client.call(&action.picker_command()) {
+                Ok(resp) => {
+                    if resp.ok {
+                        Ok(None)
+                    } else {
+                        Err(resp.error.unwrap_or_else(|| "picker command failed".into()))
+                    }
+                }
+                Err(ProtocolError::Io(_) | ProtocolError::UnexpectedEof) => {
+                    let Some(spawn_action) = action.spawn_action_arg() else {
+                        return Ok(None);
+                    };
+                    spawn_picker_detached(&paths, &project_dir, spawn_action)?;
+                    Ok(None)
+                }
+                Err(err) => Err(format!("picker IPC error: {err}")),
+            }
         }
         CtlCommand::ClearCache { deep, picker, disk } => {
             execute_clear_cache(&client, &paths, &project_dir, deep, picker, disk)
@@ -1019,8 +1069,9 @@ fn format_human_status(st: &DaemonStatus) -> String {
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "-".into());
+    let focused_output = st.focused_output.as_deref().unwrap_or("-");
     format!(
-        "engine: {}\nmode: {}\nwallpaper: {}\nvideo_mode: {}\nvideo: {}\nbackdrop_parallax: {}\ntransition: {}\nniri_connected: {}\noverview_open: {}\nbusy: {}\noutputs: {}",
+        "engine: {}\nmode: {}\nwallpaper: {}\nvideo_mode: {}\nvideo: {}\nbackdrop_parallax: {}\ntransition: {}\nniri_connected: {}\noverview_open: {}\nfocused_output: {}\nbusy: {}\noutputs: {}",
         st.engine.as_str(),
         st.mode.as_str(),
         wp,
@@ -1030,9 +1081,76 @@ fn format_human_status(st: &DaemonStatus) -> String {
         st.transition.transition_type.as_str(),
         st.niri_connected,
         st.overview_open,
+        focused_output,
         st.busy,
         st.outputs.len(),
     )
+}
+
+fn use_quickshell_picker() -> bool {
+    matches!(env::var("BGPICKER_USE_QS").as_deref(), Ok("1"))
+}
+
+pub fn resolve_picker_binary() -> PathBuf {
+    if let Some(env_bin) = env::var_os("BGPICKER_PICKER").filter(|s| !s.is_empty()) {
+        return PathBuf::from(env_bin);
+    }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join("bgpicker-picker");
+            if sibling.is_file() {
+                return sibling;
+            }
+        }
+    }
+    PathBuf::from("bgpicker-picker")
+}
+
+fn close_picker_best_effort(paths: &BgPickerPaths) -> bool {
+    let picker_client = PickerIpcClient::new(paths.picker_socket_path())
+        .with_timeout(Duration::from_millis(500));
+    matches!(picker_client.call(&PickerCommand::Close), Ok(resp) if resp.ok)
+}
+
+fn spawn_picker_detached(
+    paths: &BgPickerPaths,
+    project_dir: &Path,
+    action: &str,
+) -> Result<(), String> {
+    fs::create_dir_all(&paths.cache_dir).map_err(|e| e.to_string())?;
+    let log_path = paths.cache_dir.join("picker.log");
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| format!("failed to open {}: {e}", log_path.display()))?;
+    let log_err = log_file.try_clone().map_err(|e| e.to_string())?;
+
+    let picker_bin = resolve_picker_binary();
+    let mut cmd = Command::new(&picker_bin);
+    cmd.arg("--project-dir")
+        .arg(project_dir)
+        .arg("--daemon-socket")
+        .arg(paths.daemon_socket_path())
+        .arg("--picker-socket")
+        .arg(paths.picker_socket_path())
+        .arg("--action")
+        .arg(action)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_err));
+
+    // Detach into its own session so terminal/keybind closure doesn't kill the picker.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+
+    cmd.spawn()
+        .map_err(|e| format!("failed to spawn {}: {e}", picker_bin.display()))?;
+    Ok(())
 }
 
 fn resolve_daemon_binary() -> PathBuf {
@@ -1317,12 +1435,20 @@ fn execute_clear_cache(
     }
 
     if picker {
+        let closed_native = close_picker_best_effort(paths);
+        if closed_native {
+            lines.push("picker: closed".into());
+        }
         if is_quickshell_running(project_dir) {
             stop_quickshell_and_wait(project_dir);
-            ensure_quickshell_running(project_dir)?;
-            lines.push("qs picker: restarted".into());
-        } else {
-            lines.push("qs picker: not running".into());
+            if use_quickshell_picker() {
+                ensure_quickshell_running(project_dir)?;
+                lines.push("qs picker: restarted".into());
+            } else {
+                lines.push("qs picker: stopped".into());
+            }
+        } else if !closed_native {
+            lines.push("picker: not running".into());
         }
     }
 
@@ -1374,7 +1500,7 @@ fn clean_disk_caches(paths: &BgPickerPaths) -> Result<u64, String> {
         freed += clear_cache_dir(&dir, keep_blur_file.as_deref()).map_err(|e| e.to_string())?;
     }
 
-    for log_name in ["daemon.log", "simple-swaybg.log", "video.log"] {
+    for log_name in ["daemon.log", "picker.log", "simple-swaybg.log", "video.log"] {
         let log_path = paths.cache_dir.join(log_name);
         if let Ok(meta) = fs::metadata(&log_path) {
             if meta.is_file()

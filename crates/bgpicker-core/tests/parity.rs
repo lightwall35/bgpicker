@@ -14,8 +14,9 @@ use bgpicker_core::{
         WallpaperMode,
     },
     protocol::{
-        read_request, write_response, DaemonStatus, IpcClient, OutputStatus, Request, Response,
-        ResponseData,
+        read_picker_command, read_request, send_picker_command, write_picker_command,
+        write_response, DaemonStatus, IpcClient, OutputStatus, PickerCommand, PickerIpcClient,
+        Request, Response, ResponseData,
     },
 };
 use rand::rngs::StdRng;
@@ -242,6 +243,77 @@ fn niri_unknown_events_and_overview_tracking() {
         .reduce_json_line(r#"{"OverviewOpenedOrClosed":{"is_open":false}}"#)
         .unwrap();
     assert!(!s.overview_open);
+}
+
+#[test]
+fn niri_focused_output_tracks_workspaces_and_window_focus() {
+    assert_eq!(NiriState::initial().focused_output, None);
+
+    let mut s = niri_fixture();
+    assert_eq!(s.focused_output.as_deref(), Some("DP-1"));
+
+    // Activating a workspace with focused=true switches focused_output.
+    s = s.reduce(NiriEvent::WorkspaceActivated {
+        id: 3,
+        focused: true,
+    });
+    assert_eq!(s.focused_output.as_deref(), Some("DP-2"));
+
+    // Activating another workspace with focused=false preserves focused_output.
+    s = s.reduce(NiriEvent::WorkspaceActivated {
+        id: 2,
+        focused: false,
+    });
+    assert_eq!(s.focused_output.as_deref(), Some("DP-2"));
+
+    // Focusing a window on DP-1 switches focused_output to DP-1.
+    s = s.reduce(NiriEvent::WindowFocusChanged { id: Some(1) });
+    assert_eq!(s.focused_output.as_deref(), Some("DP-1"));
+
+    // Unfocusing windows keeps the focused workspace's output.
+    s = s.reduce(NiriEvent::WindowFocusChanged { id: None });
+    assert_eq!(s.focused_output.as_deref(), Some("DP-1"));
+
+    // Opening/changing a focused window on DP-2 updates focused_output.
+    s = s.reduce(NiriEvent::WindowOpenedOrChanged {
+        window: make_window(99, 3, Some(2), true, false),
+    });
+    assert_eq!(s.focused_output.as_deref(), Some("DP-2"));
+
+    // Overview toggle preserves focused_output.
+    s = s.reduce(NiriEvent::OverviewOpenedOrClosed { is_open: true });
+    assert_eq!(s.focused_output.as_deref(), Some("DP-2"));
+
+    // Fallback: if no workspace is marked is_focused, derive from the focused window's workspace.
+    s = s.reduce(NiriEvent::WorkspacesChanged {
+        workspaces: vec![
+            Workspace {
+                id: 1,
+                idx: 1,
+                name: None,
+                output: Some("DP-1".into()),
+                is_urgent: false,
+                is_active: true,
+                is_focused: false,
+                active_window_id: Some(1),
+            },
+            Workspace {
+                id: 3,
+                idx: 1,
+                name: None,
+                output: Some("DP-2".into()),
+                is_urgent: false,
+                is_active: true,
+                is_focused: false,
+                active_window_id: Some(99),
+            },
+        ],
+    });
+    assert_eq!(s.focused_output.as_deref(), Some("DP-2"));
+
+    // Clearing workspaces clears focused_output.
+    s = s.reduce(NiriEvent::WorkspacesChanged { workspaces: vec![] });
+    assert_eq!(s.focused_output, None);
 }
 
 #[test]
@@ -597,6 +669,21 @@ fn paths_and_persisted_state_roundtrip() {
         tmp.path().join("run/bgpicker-wayland-0.sock")
     );
     assert_eq!(
+        paths.picker_socket_path(),
+        tmp.path().join("run/bgpicker-picker-wayland-0.sock")
+    );
+    let mut custom_paths = paths.clone();
+    custom_paths.wayland_display = "wayland/1".to_string();
+    assert_eq!(
+        custom_paths.picker_socket_path(),
+        tmp.path().join("run/bgpicker-picker-wayland_1.sock")
+    );
+    custom_paths.picker_socket_override = Some(tmp.path().join("custom-picker.sock"));
+    assert_eq!(
+        custom_paths.picker_socket_path(),
+        tmp.path().join("custom-picker.sock")
+    );
+    assert_eq!(
         paths.legacy_swaybg_cache_file(),
         tmp.path().join("home/.cache/current_swaybg_img")
     );
@@ -648,6 +735,7 @@ fn protocol_ipc_roundtrip_over_unix_socket() {
                     busy: false,
                     niri_connected: true,
                     overview_open: false,
+                    focused_output: Some("DP-1".into()),
                     outputs: vec![OutputStatus {
                         name: "DP-1".into(),
                         width: 1920,
@@ -676,6 +764,7 @@ fn protocol_ipc_roundtrip_over_unix_socket() {
         Some(ResponseData::Status(st)) => {
             assert_eq!(st.mode, WallpaperMode::Parallax);
             assert!(st.niri_connected);
+            assert_eq!(st.focused_output.as_deref(), Some("DP-1"));
             assert_eq!(st.outputs.len(), 1);
             assert_eq!(st.outputs[0].name, "DP-1");
         }
@@ -683,4 +772,59 @@ fn protocol_ipc_roundtrip_over_unix_socket() {
     }
 
     server.join().unwrap();
+}
+
+#[test]
+fn protocol_picker_command_wire_format_and_socket_roundtrip() {
+    let cases = [
+        (PickerCommand::Ping, r#"{"cmd":"ping"}"#),
+        (PickerCommand::Toggle, r#"{"cmd":"toggle"}"#),
+        (PickerCommand::Open, r#"{"cmd":"open"}"#),
+        (PickerCommand::Close, r#"{"cmd":"close"}"#),
+        (PickerCommand::CycleNext, r#"{"cmd":"cycle_next"}"#),
+        (PickerCommand::CyclePrevious, r#"{"cmd":"cycle_previous"}"#),
+    ];
+
+    for (cmd, expected_json) in cases {
+        let mut buf = Vec::new();
+        write_picker_command(&mut buf, &cmd).unwrap();
+        assert_eq!(String::from_utf8(buf.clone()).unwrap(), format!("{expected_json}\n"));
+        let mut reader = BufReader::new(buf.as_slice());
+        assert_eq!(read_picker_command(&mut reader).unwrap(), Some(cmd));
+        assert_eq!(read_picker_command(&mut reader).unwrap(), None);
+    }
+
+    let tmp = TempDir::new("picker-ipc");
+    let sock = tmp.path().join("picker.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+
+    let server = thread::spawn(move || {
+        let mut received = Vec::new();
+        for _ in 0..cases.len() {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let cmd = read_picker_command(&mut reader).unwrap().unwrap();
+            received.push(cmd);
+            let resp = match cmd {
+                PickerCommand::Ping => Response::ok(ResponseData::Pong),
+                _ => Response::ok_empty(),
+            };
+            write_response(&mut stream, &resp).unwrap();
+        }
+        received
+    });
+
+    let client = PickerIpcClient::new(&sock).with_timeout(Duration::from_secs(2));
+    let ping = client.call(&PickerCommand::Ping).unwrap();
+    assert!(ping.ok);
+    assert_eq!(ping.data, Some(ResponseData::Pong));
+
+    for (cmd, _) in &cases[1..] {
+        let resp = send_picker_command(&sock, cmd, Duration::from_secs(2)).unwrap();
+        assert!(resp.ok);
+    }
+
+    let received = server.join().unwrap();
+    let expected: Vec<PickerCommand> = cases.iter().map(|(c, _)| *c).collect();
+    assert_eq!(received, expected);
 }

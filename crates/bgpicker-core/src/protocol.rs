@@ -197,9 +197,23 @@ pub struct DaemonStatus {
     pub busy: bool,
     pub niri_connected: bool,
     pub overview_open: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_output: Option<String>,
     pub outputs: Vec<OutputStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// Client-to-picker JSON-line control command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+pub enum PickerCommand {
+    Ping,
+    Toggle,
+    Open,
+    Close,
+    CycleNext,
+    CyclePrevious,
 }
 
 /// Typed payload inside [`Response::data`].
@@ -288,6 +302,73 @@ pub fn read_response<R: BufRead>(reader: &mut R) -> Result<Response, ProtocolErr
         return Err(ProtocolError::UnexpectedEof);
     }
     Ok(serde_json::from_str(line.trim())?)
+}
+
+/// Writes one newline-delimited JSON picker command and flushes the stream.
+pub fn write_picker_command<W: Write>(
+    writer: &mut W,
+    cmd: &PickerCommand,
+) -> Result<(), ProtocolError> {
+    serde_json::to_writer(&mut *writer, cmd)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
+}
+
+/// Reads one newline-delimited JSON picker command (`Ok(None)` on clean EOF).
+pub fn read_picker_command<R: BufRead>(
+    reader: &mut R,
+) -> Result<Option<PickerCommand>, ProtocolError> {
+    let mut line = String::new();
+    let n = reader.read_line(&mut line)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_str(line.trim())?))
+}
+
+/// Sends one [`PickerCommand`] to `socket_path` and awaits one [`Response`].
+pub fn send_picker_command(
+    socket_path: &Path,
+    cmd: &PickerCommand,
+    timeout: Duration,
+) -> Result<Response, ProtocolError> {
+    let mut stream = UnixStream::connect(socket_path)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    write_picker_command(&mut stream, cmd)?;
+    let mut reader = BufReader::new(stream);
+    read_response(&mut reader)
+}
+
+/// Synchronous Unix-socket IPC client for `bgpicker-picker`.
+#[derive(Debug, Clone)]
+pub struct PickerIpcClient {
+    socket_path: PathBuf,
+    timeout: Duration,
+}
+
+impl PickerIpcClient {
+    pub fn new(socket_path: impl Into<PathBuf>) -> Self {
+        Self {
+            socket_path: socket_path.into(),
+            timeout: Duration::from_millis(500),
+        }
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    /// Sends one command and awaits one response from `bgpicker-picker`.
+    pub fn call(&self, cmd: &PickerCommand) -> Result<Response, ProtocolError> {
+        send_picker_command(&self.socket_path, cmd, self.timeout)
+    }
 }
 
 /// Synchronous Unix-socket IPC client for `bgpickerctl` and callers.

@@ -14,16 +14,16 @@ use bgpicker_core::paths::{
     WallpaperMode,
 };
 use bgpicker_core::protocol::{
-    BackdropAction, BackdropOverride, EngineAction, IpcClient, ModeAction, Request, ResponseData,
-    VideoModeAction,
+    read_picker_command, write_response, BackdropAction, BackdropOverride, EngineAction, IpcClient,
+    ModeAction, PickerCommand, Request, Response, ResponseData, VideoModeAction,
 };
 use bgpicker_daemon::ctl::{parse_args, CtlCommand, PickerAction, VideoSubcommand};
 use bgpicker_daemon::daemon::{DaemonInstance, DaemonOptions};
 use bgpicker_daemon::renderer::RendererBackend;
 use bgpicker_daemon::video::{RealVideoBackend, VideoBackend, VideoReadyFrame};
 use bgpicker_gfx::{
-    FrameInput, KawaseSettings, LayerRole, LayerTargets, OutputSnapshot, ParallaxSettings,
-    SurfaceSnapshot, TransitionEffect, TransitionSpec,
+    FrameInput, FrameModeTargets, KawaseSettings, LayerRole, LayerTargets, OutputSnapshot,
+    ParallaxSettings, SurfaceSnapshot, TransitionEffect, TransitionSpec,
 };
 
 struct TempDir {
@@ -87,6 +87,7 @@ enum RecordedRenderOp {
         effect: TransitionEffect,
         duration_ms: u32,
         targets: LayerTargets,
+        modes: FrameModeTargets,
     },
     SetProgress {
         output: Option<String>,
@@ -157,17 +158,29 @@ impl RendererBackend for MockRenderer {
         frame: FrameInput,
         transition: TransitionSpec,
         targets: LayerTargets,
+        modes: FrameModeTargets,
     ) -> Result<(), String> {
         self.ops.lock().unwrap().push(RecordedRenderOp::ApplyFrame {
             media_key: frame.media_key,
             effect: transition.effect,
             duration_ms: transition.duration_ms,
             targets,
+            modes,
         });
         if let Some(out) = self.outputs.lock().unwrap().first_mut() {
-            out.wallpaper.presented = true;
-            if let Some(ref mut b) = out.backdrop {
-                b.presented = true;
+            if targets.includes_wallpaper() {
+                out.wallpaper.presented = true;
+                if let Some(p) = modes.wallpaper_parallax {
+                    out.wallpaper.mode_blend = if p { 1.0 } else { 0.0 };
+                }
+            }
+            if targets.includes_backdrop() {
+                if let Some(ref mut b) = out.backdrop {
+                    b.presented = true;
+                    if let Some(p) = modes.backdrop_parallax {
+                        b.mode_blend = if p { 1.0 } else { 0.0 };
+                    }
+                }
             }
         }
         Ok(())
@@ -694,11 +707,13 @@ fn daemon_niri_stream_and_inotify_settings_reload() {
 
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut overview_seen = false;
+    let mut focused_output_seen = None;
     while Instant::now() < deadline {
         if let Ok(resp) = client.call(&Request::Status) {
             if let Some(ResponseData::Status(st)) = resp.data {
                 if st.niri_connected && st.overview_open {
                     overview_seen = true;
+                    focused_output_seen = st.focused_output;
                     break;
                 }
             }
@@ -706,6 +721,7 @@ fn daemon_niri_stream_and_inotify_settings_reload() {
         thread::sleep(Duration::from_millis(20));
     }
     assert!(overview_seen, "expected niri overview_open=true in status");
+    assert_eq!(focused_output_seen.as_deref(), Some("DP-1"));
     assert!(video.overview_history.lock().unwrap().contains(&true));
     assert!(renderer.take_ops().iter().any(|op| matches!(
         op,
@@ -1057,19 +1073,18 @@ fn foreground_backdrop_sync_custom_combos_and_overrides() {
         BackdropParallax::On
     );
     let ops = renderer.take_ops();
+    assert!(
+        ops.iter().all(|op| !matches!(op, RecordedRenderOp::SetMode { .. })),
+        "apply-static must not emit pre-transition SetMode: {ops:?}"
+    );
     assert!(ops.iter().any(|op| matches!(
         op,
-        RecordedRenderOp::SetMode {
-            parallax: false,
-            targets: LayerTargets::WallpaperOnly,
-            ..
-        }
-    )));
-    assert!(ops.iter().any(|op| matches!(
-        op,
-        RecordedRenderOp::SetMode {
-            parallax: true,
-            targets: LayerTargets::BackdropOnly,
+        RecordedRenderOp::ApplyFrame {
+            targets: LayerTargets::Both,
+            modes: FrameModeTargets {
+                wallpaper_parallax: Some(false),
+                backdrop_parallax: Some(true),
+            },
             ..
         }
     )));
@@ -1718,4 +1733,420 @@ fn clear_cache_disk_clears_caches_and_preserves_simple_swaybg_blur() {
     assert!(!cache_dir.join("image-thumbnails/img.jpg").exists());
     assert!(!cache_dir.join("video-thumbnails/vid.jpg").exists());
     assert_eq!(fs::metadata(cache_dir.join("daemon.log")).unwrap().len(), 0);
+}
+
+#[test]
+fn ctl_picker_ipc_forwarding_spawn_and_close_lifecycle() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("ctl-picker");
+    let root = tmp.path();
+    let paths = isolated_paths(root);
+    let proj = root.join("proj");
+    fs::create_dir_all(proj.join("wallpapers")).unwrap();
+    let img = proj.join("wallpapers/a.png");
+    write_tiny_png(&img);
+
+    let ctl_bin = env!("CARGO_BIN_EXE_bgpickerctl");
+    let daemon_sock = paths.daemon_socket_path();
+    let picker_sock = root.join("runtime/custom-picker.sock");
+    let spawn_log = root.join("picker-spawns.log");
+
+    // Mock bgpicker-picker binary that logs its exact CLI args and stdout/stderr.
+    let fake_picker = root.join("fake-bgpicker-picker");
+    fs::write(
+        &fake_picker,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\necho \"picker-log-line\"\n",
+            spawn_log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_picker, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let run_ctl = |args: &[&str]| {
+        Command::new(ctl_bin)
+            .args([
+                "--socket",
+                daemon_sock.to_str().unwrap(),
+                "--project-dir",
+                proj.to_str().unwrap(),
+            ])
+            .args(args)
+            .env("HOME", root.join("home"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_RUNTIME_DIR", root.join("runtime"))
+            .env("BGPICKER_PICKER", &fake_picker)
+            .env("BGPICKER_PICKER_SOCKET", &picker_sock)
+            .env_remove("BGPICKER_USE_QS")
+            .env_remove("NIRI_SOCKET")
+            .output()
+            .expect("run bgpickerctl")
+    };
+
+    // 1. `picker close` when picker AND daemon are not running is a clean no-op:
+    //    must NOT start daemon and must NOT spawn bgpicker-picker.
+    let close_noop = run_ctl(&["picker", "close"]);
+    assert!(
+        close_noop.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&close_noop.stderr)
+    );
+    assert!(!daemon_sock.exists(), "picker close must not start daemon");
+    assert!(!spawn_log.exists(), "picker close must not spawn picker");
+
+    // Start a mock daemon so picker commands have a live daemon.
+    let renderer = Arc::new(MockRenderer::new());
+    let video = Arc::new(MockVideo::new());
+    let opts = DaemonOptions {
+        paths: paths.clone(),
+        project_dir: proj.clone(),
+        restore_on_start: false,
+        enable_niri: false,
+        enable_settings_watch: false,
+    };
+    let mut daemon = DaemonInstance::start_with_backends(opts, renderer, video)
+        .expect("start mock daemon");
+    let stop_sig = daemon.stop_notifier();
+    let daemon_thread = thread::spawn(move || {
+        let (lock, cv) = &*stop_sig;
+        let mut stopped = lock.lock().unwrap();
+        while !*stopped {
+            stopped = cv.wait(stopped).unwrap();
+        }
+        drop(stopped);
+        daemon.shutdown();
+    });
+
+    // 2. When picker socket is NOT live, toggle/open/next/prev spawn detached bgpicker-picker
+    //    with the expected CLI flags and redirect output to cache_dir/picker.log.
+    for (cli_action, expected_flag) in [
+        ("toggle", "open"),
+        ("open", "open"),
+        ("next", "cycle-next"),
+        ("prev", "cycle-prev"),
+    ] {
+        let _ = fs::remove_file(&spawn_log);
+        let out = run_ctl(&["picker", cli_action]);
+        assert!(
+            out.status.success(),
+            "{cli_action} stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !spawn_log.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let expected_line = format!(
+            "--project-dir {} --daemon-socket {} --picker-socket {} --action {}",
+            proj.display(),
+            daemon_sock.display(),
+            picker_sock.display(),
+            expected_flag,
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut recorded = String::new();
+        while Instant::now() < deadline {
+            recorded = fs::read_to_string(&spawn_log).unwrap_or_default();
+            if recorded.trim() == expected_line {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(recorded.trim(), expected_line);
+    }
+
+    let picker_log = paths.cache_dir.join("picker.log");
+    assert!(
+        picker_log.is_file(),
+        "expected spawned picker output in {}",
+        picker_log.display()
+    );
+
+    // 3. When picker socket IS live, toggle/open/next/prev/close + clear-cache --picker + stop
+    //    forward PickerCommand over the Unix socket without spawning a new picker binary.
+    let _ = fs::remove_file(&spawn_log);
+    let listener = UnixListener::bind(&picker_sock).expect("bind mock picker socket");
+    let expected_cmds = vec![
+        PickerCommand::Toggle,
+        PickerCommand::Open,
+        PickerCommand::CycleNext,
+        PickerCommand::CyclePrevious,
+        PickerCommand::Close,
+        PickerCommand::Close, // clear-cache --picker
+        PickerCommand::Close, // stop
+    ];
+    let expected_count = expected_cmds.len();
+    let mock_picker_server = thread::spawn(move || {
+        let mut got = Vec::new();
+        for _ in 0..expected_count {
+            let (mut stream, _) = listener.accept().expect("accept picker ipc");
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let cmd = read_picker_command(&mut reader).unwrap().unwrap();
+            got.push(cmd);
+            write_response(&mut stream, &Response::ok_empty()).unwrap();
+        }
+        got
+    });
+
+    for cli_action in ["toggle", "open", "next", "prev", "close"] {
+        let out = run_ctl(&["picker", cli_action]);
+        assert!(
+            out.status.success(),
+            "live {cli_action} stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let clear_out = run_ctl(&["clear-cache", "--picker"]);
+    assert!(
+        clear_out.status.success(),
+        "clear-cache --picker stderr: {}",
+        String::from_utf8_lossy(&clear_out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&clear_out.stdout).contains("picker: closed"),
+        "stdout: {}",
+        String::from_utf8_lossy(&clear_out.stdout)
+    );
+
+    let stop_out = run_ctl(&["stop"]);
+    assert!(
+        stop_out.status.success(),
+        "stop stderr: {}",
+        String::from_utf8_lossy(&stop_out.stderr)
+    );
+
+    let received = mock_picker_server.join().unwrap();
+    assert_eq!(received, expected_cmds);
+    assert!(
+        !spawn_log.exists(),
+        "live picker socket should never spawn a second picker binary"
+    );
+
+    daemon_thread.join().unwrap();
+}
+
+#[test]
+fn cross_mode_media_switch_applies_modes_atomically_without_pre_snap() {
+    let tmp = TempDir::new("atomic-mode-switch");
+    let paths = isolated_paths(tmp.path());
+    let proj = tmp.path().join("proj");
+    fs::create_dir_all(proj.join("wallpapers")).unwrap();
+    fs::create_dir_all(proj.join("dynamic")).unwrap();
+
+    let img_a = proj.join("wallpapers/a.png");
+    let img_b = proj.join("wallpapers/b.png");
+    write_tiny_png(&img_a);
+    write_tiny_png(&img_b);
+    let vid_a = proj.join("dynamic/a.mp4");
+    fs::write(&vid_a, b"dummy-video").unwrap();
+
+    let renderer = Arc::new(MockRenderer::new());
+    let video = Arc::new(MockVideo::new());
+
+    let opts = DaemonOptions {
+        paths,
+        project_dir: proj,
+        restore_on_start: false,
+        enable_niri: false,
+        enable_settings_watch: false,
+    };
+    let mut daemon = DaemonInstance::start_with_backends(opts, renderer.clone(), video)
+        .expect("start daemon");
+    let client = IpcClient::new(daemon.socket_path());
+
+    // Start in Video (parallax) mode.
+    assert!(client
+        .call(&Request::ApplyVideo {
+            mode: Some(VideoModeAction::Parallax),
+            path: Some(vid_a.clone()),
+            backdrop: BackdropOverride::Auto,
+        })
+        .unwrap()
+        .ok);
+
+    // 1. Video (parallax) -> ApplyStatic (awww):
+    //    Must NOT emit pre-transition SetMode(..., Some(0)); modes travel atomically on ApplyFrame.
+    let _ = renderer.take_ops();
+    assert!(client
+        .call(&Request::ApplyStatic {
+            path: img_a.clone(),
+            mode: Some(WallpaperMode::Awww),
+            instant: false,
+            backdrop: BackdropOverride::Auto,
+        })
+        .unwrap()
+        .ok);
+    let ops = renderer.take_ops();
+    assert!(
+        ops.iter().all(|op| !matches!(op, RecordedRenderOp::SetMode { .. })),
+        "Video (parallax) -> ApplyStatic (awww) emitted pre-transition SetMode: {ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            op,
+            RecordedRenderOp::ApplyFrame {
+                duration_ms,
+                targets: LayerTargets::Both,
+                modes: FrameModeTargets {
+                    wallpaper_parallax: Some(false),
+                    backdrop_parallax: Some(false),
+                },
+                ..
+            } if *duration_ms > 0
+        )),
+        "expected atomic ApplyFrame with target modes, got {ops:?}"
+    );
+
+    // 2. Same-static SetMode (awww -> parallax) still smoothly blends in place with mode_transition_ms > 0.
+    let _ = renderer.take_ops();
+    assert!(client
+        .call(&Request::SetMode {
+            mode: ModeAction::Parallax,
+            backdrop: BackdropOverride::Auto,
+        })
+        .unwrap()
+        .ok);
+    let ops = renderer.take_ops();
+    assert!(
+        ops.iter().all(|op| !matches!(op, RecordedRenderOp::ApplyFrame { .. })),
+        "same-static SetMode must not re-apply frame: {ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            op,
+            RecordedRenderOp::SetMode {
+                parallax: true,
+                duration_ms: Some(dur),
+                targets: LayerTargets::Both,
+            } if *dur > 0
+        )),
+        "expected smooth SetMode on same-static toggle, got {ops:?}"
+    );
+
+    // 3. Full (parallax) -> ApplyVideo (normal):
+    //    Must NOT emit pre-transition SetMode(..., Some(0)); modes travel atomically on ApplyFrame.
+    let _ = renderer.take_ops();
+    assert!(client
+        .call(&Request::ApplyVideo {
+            mode: Some(VideoModeAction::Normal),
+            path: Some(vid_a.clone()),
+            backdrop: BackdropOverride::Auto,
+        })
+        .unwrap()
+        .ok);
+    let ops = renderer.take_ops();
+    assert!(
+        ops.iter().all(|op| !matches!(op, RecordedRenderOp::SetMode { .. })),
+        "Full (parallax) -> ApplyVideo (normal) emitted pre-transition SetMode: {ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            op,
+            RecordedRenderOp::ApplyFrame {
+                duration_ms,
+                targets: LayerTargets::Both,
+                modes: FrameModeTargets {
+                    wallpaper_parallax: Some(false),
+                    backdrop_parallax: Some(false),
+                },
+                ..
+            } if *duration_ms > 0
+        )),
+        "expected atomic ApplyFrame on Full -> Video, got {ops:?}"
+    );
+
+    // 4. Same-video ApplyVideo fast path (normal -> parallax) still smoothly blends via SetMode.
+    let _ = renderer.take_ops();
+    assert!(client
+        .call(&Request::ApplyVideo {
+            mode: Some(VideoModeAction::Parallax),
+            path: Some(vid_a.clone()),
+            backdrop: BackdropOverride::Auto,
+        })
+        .unwrap()
+        .ok);
+    let ops = renderer.take_ops();
+    assert!(
+        ops.iter().all(|op| !matches!(op, RecordedRenderOp::ApplyFrame { .. })),
+        "same-video fast path must not re-apply frame: {ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            op,
+            RecordedRenderOp::SetMode {
+                parallax: true,
+                duration_ms: Some(dur),
+                targets: LayerTargets::Both,
+            } if *dur > 0
+        )),
+        "expected smooth SetMode on same-video toggle, got {ops:?}"
+    );
+
+    // 5. Video (parallax) -> SetMode (awww) delegates to cmd_apply_static and passes modes atomically too.
+    let _ = renderer.take_ops();
+    assert!(client
+        .call(&Request::SetMode {
+            mode: ModeAction::Awww,
+            backdrop: BackdropOverride::Auto,
+        })
+        .unwrap()
+        .ok);
+    let ops = renderer.take_ops();
+    assert!(
+        ops.iter().all(|op| !matches!(op, RecordedRenderOp::SetMode { .. })),
+        "Video -> Full via SetMode emitted pre-transition SetMode: {ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            op,
+            RecordedRenderOp::ApplyFrame {
+                duration_ms,
+                targets: LayerTargets::Both,
+                modes: FrameModeTargets {
+                    wallpaper_parallax: Some(false),
+                    backdrop_parallax: Some(false),
+                },
+                ..
+            } if *duration_ms > 0
+        )),
+        "expected atomic ApplyFrame on Video -> Full via SetMode, got {ops:?}"
+    );
+
+    // 6. Full (awww) -> ApplyStatic (img_b, parallax): atomic without pre-snap.
+    let _ = renderer.take_ops();
+    assert!(client
+        .call(&Request::ApplyStatic {
+            path: img_b,
+            mode: Some(WallpaperMode::Parallax),
+            instant: false,
+            backdrop: BackdropOverride::Auto,
+        })
+        .unwrap()
+        .ok);
+    let ops = renderer.take_ops();
+    assert!(
+        ops.iter().all(|op| !matches!(op, RecordedRenderOp::SetMode { .. })),
+        "Full (awww) -> ApplyStatic (parallax) emitted pre-transition SetMode: {ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            op,
+            RecordedRenderOp::ApplyFrame {
+                duration_ms,
+                targets: LayerTargets::Both,
+                modes: FrameModeTargets {
+                    wallpaper_parallax: Some(true),
+                    backdrop_parallax: Some(true),
+                },
+                ..
+            } if *duration_ms > 0
+        )),
+        "expected atomic ApplyFrame with parallax=true, got {ops:?}"
+    );
+
+    daemon.shutdown();
 }

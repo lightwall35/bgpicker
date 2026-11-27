@@ -1,0 +1,29 @@
+[package]
+name = "bgpicker-picker"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Pure-Rust GPU-accelerated wallpaper picker UI, bounded thumbnail cache, HiDPI CJK/Latin text atlas, and single-pass GLES/GL renderer"
+
+[[bin]]
+name = "bgpicker-picker"
+path = "src/bin/bgpicker-picker.rs"
+
+[dependencies]
+bgpicker-core = { path = "../bgpicker-core" }
+bgpicker-gfx = { path = "../bgpicker-gfx" }
+bytemuck = { version = "1.25", features = ["derive"] }
+calloop = "0.14"
+glow = "0.18"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif"] }
+khronos-egl = { version = "6.0", features = ["static", "1_5"] }
+libc = "0.2"
+log = "0.4"
+percent-encoding = "2.3"
+smithay-client-toolkit = { version = "0.21", features = ["calloop", "system", "xkbcommon"] }
+swash = "0.2"
+thiserror = "2"
+wayland-client = { version = "0.31", features = ["system"] }
+wayland-egl = "0.32"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }

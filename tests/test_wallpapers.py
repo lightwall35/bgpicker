@@ -28,6 +28,7 @@ class WallpaperTests(unittest.TestCase):
             BGPICKER_BLUR_SIGMA="3",
         )
         self.env.pop("BGPICKERCTL", None)
+        self.env.pop("BGPICKER_USE_QS", None)
         self.run_command(["magick", "-size", "128x96", "pattern:checkerboard", str(self.original)])
 
     def run_command(self, command, *, check=True, env=None):
@@ -341,21 +342,35 @@ int main(int argc, char **argv) {
 
     def test_wallpaper_engine_and_qs_picker_lifecycle(self):
         self.mock_ctl_and_qs()
+        # Default native picker mode: no resident qs process is spawned.
         self.env["MOCK_ENGINE_STATUS"] = "full"
         self.run_command([str(PROJECT / "wallpaper_engine.sh"), "startup"])
-        self.assertTrue((self.root / "qs.alive").exists())
+        self.assertFalse((self.root / "qs.alive").exists())
 
+        # Entering simple still stops legacy qs if it happened to be running.
+        (self.root / "qs.alive").write_text("1")
         self.env["MOCK_ENGINE_STATUS"] = "simple"
         self.run_command([str(PROJECT / "wallpaper_engine.sh"), "simple"])
         self.assertFalse((self.root / "qs.alive").exists())
 
         self.run_command([str(PROJECT / "wallpaper_engine.sh"), "full", str(self.original), "parallax"])
-        self.assertTrue((self.root / "qs.alive").exists())
+        self.assertFalse((self.root / "qs.alive").exists())
 
         ctl_calls = [c[1] for c in self.read_calls() if c[0] == "bgpickerctl"]
         self.assertIn(["startup"], ctl_calls)
         self.assertIn(["engine", "simple"], ctl_calls)
         self.assertIn(["apply-static", str(self.original), "--mode", "parallax"], ctl_calls)
+
+        # Legacy BGPICKER_USE_QS=1 fallback preserves resident qs lifecycle.
+        qs_env = dict(self.env, BGPICKER_USE_QS="1", MOCK_ENGINE_STATUS="full")
+        self.run_command([str(PROJECT / "wallpaper_engine.sh"), "startup"], env=qs_env)
+        self.assertTrue((self.root / "qs.alive").exists())
+
+        self.run_command([str(PROJECT / "wallpaper_engine.sh"), "simple"], env=dict(qs_env, MOCK_ENGINE_STATUS="simple"))
+        self.assertFalse((self.root / "qs.alive").exists())
+
+        self.run_command([str(PROJECT / "wallpaper_engine.sh"), "full", str(self.original), "parallax"], env=qs_env)
+        self.assertTrue((self.root / "qs.alive").exists())
 
     def test_wallpaper_engine_status_and_toggle_transitions(self):
         self.mock_ctl_and_qs()
@@ -383,7 +398,7 @@ int main(int argc, char **argv) {
             "full",
         )
 
-        # toggle full -> simple stops qs; toggle simple -> full starts qs
+        # Default mode: toggle full -> simple stops legacy qs; toggle simple -> full does not spawn qs
         self.env["MOCK_ENGINE_STATUS"] = "simple"
         (self.root / "qs.alive").write_text("1")
         self.run_command([str(PROJECT / "wallpaper_engine.sh"), "toggle"])
@@ -391,6 +406,11 @@ int main(int argc, char **argv) {
 
         self.env["MOCK_ENGINE_STATUS"] = "full"
         self.run_command([str(PROJECT / "wallpaper_engine.sh"), "toggle"])
+        self.assertFalse((self.root / "qs.alive").exists())
+
+        # Legacy BGPICKER_USE_QS=1: toggle simple -> full starts qs
+        qs_env = dict(self.env, BGPICKER_USE_QS="1", MOCK_ENGINE_STATUS="full")
+        self.run_command([str(PROJECT / "wallpaper_engine.sh"), "toggle"], env=qs_env)
         self.assertTrue((self.root / "qs.alive").exists())
 
     def test_simple_wallpaper_dual_swaybg_lifecycle_and_stop(self):
@@ -476,19 +496,40 @@ int main(int argc, char **argv) {
         self.run_command([str(PROJECT / "backdrop_awww.sh")], env=env)
         self.assertEqual(custom_log.read_text().splitlines(), ["backdrop-parallax on", "start"])
 
+        # Default mode delegates picker actions directly to bgpickerctl without spawning qs.
+        self.run_command([str(PROJECT / "bgpicker.sh"), "start"])
         self.run_command([str(PROJECT / "bgpicker.sh"), "toggle"])
+        self.run_command([str(PROJECT / "bgpicker.sh"), "open"])
+        self.run_command([str(PROJECT / "bgpicker.sh"), "close"])
         self.run_command([str(PROJECT / "bgpicker.sh"), "next"])
+        self.run_command([str(PROJECT / "bgpicker.sh"), "prev"])
         self.run_command([str(PROJECT / "bgpicker.sh"), "transition", "wave"])
         self.run_command([str(PROJECT / "bgpicker.sh"), "video", "next"])
         self.run_command([str(PROJECT / "bgpicker.sh"), "stop"])
         self.assertFalse((self.root / "qs.alive").exists())
 
         calls = self.read_calls()
-        self.assertIn(["qs", ["ipc", "-p", str(PROJECT), "call", "wallpaperCarousel", "toggle"]], calls)
-        self.assertIn(["qs", ["ipc", "-p", str(PROJECT), "call", "wallpaperCarousel", "cycleNext"]], calls)
+        self.assertIn(["bgpickerctl", ["start"]], calls)
+        self.assertIn(["bgpickerctl", ["picker", "toggle"]], calls)
+        self.assertIn(["bgpickerctl", ["picker", "open"]], calls)
+        self.assertIn(["bgpickerctl", ["picker", "close"]], calls)
+        self.assertIn(["bgpickerctl", ["picker", "next"]], calls)
+        self.assertIn(["bgpickerctl", ["picker", "prev"]], calls)
         self.assertIn(["bgpickerctl", ["transition", "wave"]], calls)
         self.assertIn(["bgpickerctl", ["video", "next"]], calls)
         self.assertIn(["bgpickerctl", ["stop"]], calls)
+        self.assertFalse(any(c[0] == "qs" and "-d" in c[1] for c in calls))
+
+        # Legacy BGPICKER_USE_QS=1 fallback keeps qs ipc flow and stop cleanup.
+        qs_env = dict(self.env, BGPICKER_USE_QS="1")
+        self.run_command([str(PROJECT / "bgpicker.sh"), "toggle"], env=qs_env)
+        self.run_command([str(PROJECT / "bgpicker.sh"), "next"], env=qs_env)
+        self.run_command([str(PROJECT / "bgpicker.sh"), "stop"], env=qs_env)
+        self.assertFalse((self.root / "qs.alive").exists())
+
+        calls = self.read_calls()
+        self.assertIn(["qs", ["ipc", "-p", str(PROJECT), "call", "wallpaperCarousel", "toggle"]], calls)
+        self.assertIn(["qs", ["ipc", "-p", str(PROJECT), "call", "wallpaperCarousel", "cycleNext"]], calls)
 
 
 if __name__ == "__main__":

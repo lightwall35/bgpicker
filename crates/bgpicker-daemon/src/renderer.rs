@@ -4,8 +4,9 @@ use std::thread::{self, JoinHandle};
 
 use bgpicker_core::{ParallaxSettings as CoreParallaxSettings, ResolvedTransition};
 use bgpicker_gfx::{
-    FrameInput, KawaseSettings, LayerTargets, OutputSnapshot, ParallaxSettings as GfxParallaxSettings,
-    RenderCommand, RendererHandle, TransitionEffect, TransitionSpec, WaylandRenderer,
+    FrameInput, FrameModeTargets, KawaseSettings, LayerTargets, OutputSnapshot,
+    ParallaxSettings as GfxParallaxSettings, RenderCommand, RendererHandle, TransitionEffect,
+    TransitionSpec, WaylandRenderer,
 };
 
 /// Converts core `ParallaxSettings` to `bgpicker-gfx` `ParallaxSettings`.
@@ -50,6 +51,7 @@ pub trait RendererBackend: Send + Sync {
         frame: FrameInput,
         transition: TransitionSpec,
         targets: LayerTargets,
+        modes: FrameModeTargets,
     ) -> Result<(), String>;
     fn push_video_frame(&self, frame: FrameInput, sync_backdrop: bool) -> Result<(), String>;
     fn set_progress(
@@ -129,12 +131,14 @@ impl RendererBackend for GfxRendererBackend {
         frame: FrameInput,
         transition: TransitionSpec,
         targets: LayerTargets,
+        modes: FrameModeTargets,
     ) -> Result<(), String> {
         self.handle
             .send(RenderCommand::ApplyFrame {
                 frame,
                 transition,
                 targets,
+                modes,
             })
             .map_err(|e| e.to_string())
     }

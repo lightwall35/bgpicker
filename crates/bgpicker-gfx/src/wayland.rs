@@ -70,6 +70,13 @@ impl LayerTargets {
     }
 }
 
+/// Optional per-layer parallax mode targets applied atomically with a frame commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FrameModeTargets {
+    pub wallpaper_parallax: Option<bool>,
+    pub backdrop_parallax: Option<bool>,
+}
+
 /// Commands accepted by a running [`WaylandRenderer`] via [`RendererHandle`].
 #[derive(Debug, Clone)]
 pub enum RenderCommand {
@@ -77,6 +84,7 @@ pub enum RenderCommand {
         frame: FrameInput,
         transition: TransitionSpec,
         targets: LayerTargets,
+        modes: FrameModeTargets,
     },
     StageFrame {
         frame: FrameInput,
@@ -85,6 +93,7 @@ pub enum RenderCommand {
     CommitStaged {
         transition: TransitionSpec,
         targets: LayerTargets,
+        modes: FrameModeTargets,
     },
     CancelStaged {
         targets: LayerTargets,
@@ -539,29 +548,38 @@ impl WaylandApp {
                 frame,
                 transition,
                 targets,
+                modes,
             } => {
                 if targets.includes_wallpaper() {
                     self.active.wallpaper_frame = Some(frame.clone());
+                    if let Some(p) = modes.wallpaper_parallax {
+                        self.active.wallpaper_parallax = p;
+                    }
                 }
                 if targets.includes_backdrop() {
                     self.active.backdrop_frame = Some(frame.clone());
+                    if let Some(p) = modes.backdrop_parallax {
+                        self.active.backdrop_parallax = p;
+                    }
                 }
                 for out in &mut self.outputs {
                     if targets.includes_wallpaper() {
-                        let _ = out.wallpaper.pipeline.apply_frame(
+                        let _ = out.wallpaper.pipeline.apply_frame_with_mode(
                             &self.egl.gl,
                             &frame,
                             transition,
+                            modes.wallpaper_parallax,
                             self.egl.bgra_ext_supported,
                         );
                     }
                     if targets.includes_backdrop()
                         && let Some(ref mut b) = out.backdrop
                     {
-                        let _ = b.pipeline.apply_frame(
+                        let _ = b.pipeline.apply_frame_with_mode(
                             &self.egl.gl,
                             &frame,
                             transition,
+                            modes.backdrop_parallax,
                             self.egl.bgra_ext_supported,
                         );
                     }
@@ -596,15 +614,34 @@ impl WaylandApp {
             RenderCommand::CommitStaged {
                 transition,
                 targets,
+                modes,
             } => {
+                if targets.includes_wallpaper()
+                    && let Some(p) = modes.wallpaper_parallax
+                {
+                    self.active.wallpaper_parallax = p;
+                }
+                if targets.includes_backdrop()
+                    && let Some(p) = modes.backdrop_parallax
+                {
+                    self.active.backdrop_parallax = p;
+                }
                 for out in &mut self.outputs {
                     if targets.includes_wallpaper() {
-                        out.wallpaper.pipeline.commit_staged(&self.egl.gl, transition);
+                        out.wallpaper.pipeline.commit_staged_with_mode(
+                            &self.egl.gl,
+                            transition,
+                            modes.wallpaper_parallax,
+                        );
                     }
                     if targets.includes_backdrop()
                         && let Some(ref mut b) = out.backdrop
                     {
-                        b.pipeline.commit_staged(&self.egl.gl, transition);
+                        b.pipeline.commit_staged_with_mode(
+                            &self.egl.gl,
+                            transition,
+                            modes.backdrop_parallax,
+                        );
                     }
                 }
             }

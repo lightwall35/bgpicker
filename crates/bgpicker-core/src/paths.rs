@@ -187,6 +187,7 @@ pub struct BgPickerPaths {
     pub runtime_dir: PathBuf,
     pub wayland_display: String,
     pub socket_override: Option<PathBuf>,
+    pub picker_socket_override: Option<PathBuf>,
 }
 
 impl BgPickerPaths {
@@ -203,6 +204,7 @@ impl BgPickerPaths {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "wayland-0".to_string());
         let socket_override = env_path("BGPICKER_SOCKET");
+        let picker_socket_override = env_path("BGPICKER_PICKER_SOCKET");
 
         Self {
             home_dir,
@@ -212,6 +214,7 @@ impl BgPickerPaths {
             runtime_dir,
             wayland_display,
             socket_override,
+            picker_socket_override,
         }
     }
 
@@ -231,6 +234,7 @@ impl BgPickerPaths {
             runtime_dir: runtime_dir.into(),
             wayland_display: "wayland-0".to_string(),
             socket_override: None,
+            picker_socket_override: None,
         }
     }
 
@@ -291,19 +295,33 @@ impl BgPickerPaths {
         self.home_dir.join(".cache/current_swaybg_img")
     }
 
+    fn sanitized_wayland_display(&self) -> String {
+        self.wayland_display
+            .chars()
+            .map(|c| if c == '/' || c == '\0' { '_' } else { c })
+            .collect()
+    }
+
     /// Unix socket path for `bgpicker-daemon` (`BGPICKER_SOCKET` or
     /// `${XDG_RUNTIME_DIR:-/tmp}/bgpicker-${WAYLAND_DISPLAY:-wayland-0}.sock`).
     pub fn daemon_socket_path(&self) -> PathBuf {
         if let Some(ref custom) = self.socket_override {
             return custom.clone();
         }
-        let sanitized_display: String = self
-            .wayland_display
-            .chars()
-            .map(|c| if c == '/' || c == '\0' { '_' } else { c })
-            .collect();
+        let sanitized_display = self.sanitized_wayland_display();
         self.runtime_dir
             .join(format!("bgpicker-{sanitized_display}.sock"))
+    }
+
+    /// Unix socket path for `bgpicker-picker` (`BGPICKER_PICKER_SOCKET` or
+    /// `${XDG_RUNTIME_DIR:-/tmp}/bgpicker-picker-${WAYLAND_DISPLAY:-wayland-0}.sock`).
+    pub fn picker_socket_path(&self) -> PathBuf {
+        if let Some(ref custom) = self.picker_socket_override {
+            return custom.clone();
+        }
+        let sanitized_display = self.sanitized_wayland_display();
+        self.runtime_dir
+            .join(format!("bgpicker-picker-{sanitized_display}.sock"))
     }
 }
 

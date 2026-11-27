@@ -14,7 +14,7 @@ sync_picker_for_engine() {
     active_engine="$("$CTL" engine status 2>/dev/null || cat "$STATE/engine" 2>/dev/null || printf full)"
     if [[ "$active_engine" == simple ]]; then
         stop_qs >/dev/null 2>&1 || true
-    else
+    elif use_qs_picker; then
         start_qs >/dev/null 2>&1 || true
     fi
 }
@@ -43,7 +43,9 @@ case "$request" in
         else
             "$CTL" engine video
         fi
-        start_qs >/dev/null 2>&1 || true
+        if use_qs_picker; then
+            start_qs >/dev/null 2>&1 || true
+        fi
         ;;
     full)
         if [[ -n "${2:-}" && -n "${3:-}" ]]; then
@@ -53,7 +55,9 @@ case "$request" in
         else
             "$CTL" engine full
         fi
-        start_qs >/dev/null 2>&1 || true
+        if use_qs_picker; then
+            start_qs >/dev/null 2>&1 || true
+        fi
         ;;
     toggle)
         "$CTL" engine toggle

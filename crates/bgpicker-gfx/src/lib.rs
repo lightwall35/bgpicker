@@ -30,6 +30,6 @@ pub use math::{
 };
 pub use shaders::ShaderPrograms;
 pub use wayland::{
-    LayerTargets, OutputSnapshot, RenderCommand, RendererHandle, SurfaceSnapshot, WaylandRenderer,
-    compute_scaled_size,
+    FrameModeTargets, LayerTargets, OutputSnapshot, RenderCommand, RendererHandle, SurfaceSnapshot,
+    WaylandRenderer, compute_scaled_size,
 };

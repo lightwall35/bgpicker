@@ -24,7 +24,7 @@ use bgpicker_core::protocol::{
     BackdropAction, BackdropOverride, ClearCacheReport, DaemonStatus, EngineAction, ModeAction,
     OutputStatus, Request, Response, ResponseData, VideoModeAction,
 };
-use bgpicker_gfx::{KawaseSettings, LayerTargets, TransitionSpec};
+use bgpicker_gfx::{FrameModeTargets, KawaseSettings, LayerTargets};
 
 use crate::renderer::{to_gfx_parallax, to_gfx_transition, RendererBackend};
 use crate::video::VideoBackend;
@@ -43,6 +43,7 @@ pub struct SharedStatusSnapshot {
     pub busy: bool,
     pub niri_connected: bool,
     pub overview_open: bool,
+    pub focused_output: Option<String>,
     pub last_error: Option<String>,
 }
 
@@ -167,6 +168,7 @@ impl DaemonActorHandle {
             busy: snap.busy,
             niri_connected: snap.niri_connected,
             overview_open: snap.overview_open,
+            focused_output: snap.focused_output,
             outputs,
             error: snap.last_error,
         }
@@ -201,6 +203,7 @@ impl DaemonActor {
             busy: false,
             niri_connected: false,
             overview_open: false,
+            focused_output: None,
             last_error: None,
         };
 
@@ -319,6 +322,7 @@ impl ActorRunner {
                 busy,
                 niri_connected: self.niri_connected,
                 overview_open: self.niri_state.overview_open,
+                focused_output: self.niri_state.focused_output.clone(),
                 last_error: self.last_error.clone(),
             };
         }
@@ -687,28 +691,12 @@ impl ActorRunner {
         let fg_parallax =
             target_engine == EngineKind::Full && target_mode == WallpaperMode::Parallax;
         let bg_parallax = target_engine == EngineKind::Full && target_backdrop.is_on();
-        let fg_dur = if instant
-            || target_engine != EngineKind::Full
-            || self.state.engine != EngineKind::Full
-            || target_mode == self.state.mode
-        {
-            0
-        } else {
-            self.config.parallax.mode_transition_ms
+        let modes = FrameModeTargets {
+            wallpaper_parallax: Some(fg_parallax),
+            backdrop_parallax: Some(bg_parallax),
         };
-        let bg_dur = if instant
-            || target_engine != EngineKind::Full
-            || self.state.engine != EngineKind::Full
-            || target_backdrop == self.state.backdrop_parallax
-        {
-            0
-        } else {
-            self.config.parallax.mode_transition_ms
-        };
-
-        self.apply_layer_modes(fg_parallax, bg_parallax, fg_dur, bg_dur, true, true)?;
         self.renderer
-            .apply_frame(frame, spec, LayerTargets::Both)?;
+            .apply_frame(frame, spec, LayerTargets::Both, modes)?;
 
         atomic_write_text(&self.paths.engine_file(), target_engine.as_str())
             .map_err(|e| e.to_string())?;
@@ -883,19 +871,37 @@ impl ActorRunner {
         let resolved = resolve_transition(&self.raw_settings, instant);
         let spec = to_gfx_transition(resolved);
 
-        self.apply_layer_modes(
-            target_mode == VideoMode::Parallax,
-            target_backdrop.is_on(),
-            0,
-            0,
-            true,
-            true,
-        )?;
-        self.renderer
-            .apply_frame(ready.fg_frame, spec, LayerTargets::Both)?;
+        let fg_parallax = target_mode == VideoMode::Parallax;
+        let bg_parallax = target_backdrop.is_on();
         if let Some(bg_frame) = ready.bg_frame {
-            self.renderer
-                .apply_frame(bg_frame, TransitionSpec::instant(), LayerTargets::BackdropOnly)?;
+            self.renderer.apply_frame(
+                ready.fg_frame,
+                spec,
+                LayerTargets::WallpaperOnly,
+                FrameModeTargets {
+                    wallpaper_parallax: Some(fg_parallax),
+                    backdrop_parallax: None,
+                },
+            )?;
+            self.renderer.apply_frame(
+                bg_frame,
+                spec,
+                LayerTargets::BackdropOnly,
+                FrameModeTargets {
+                    wallpaper_parallax: None,
+                    backdrop_parallax: Some(bg_parallax),
+                },
+            )?;
+        } else {
+            self.renderer.apply_frame(
+                ready.fg_frame,
+                spec,
+                LayerTargets::Both,
+                FrameModeTargets {
+                    wallpaper_parallax: Some(fg_parallax),
+                    backdrop_parallax: Some(bg_parallax),
+                },
+            )?;
         }
 
         self.video.activate_stream(ready.stream_id);

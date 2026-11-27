@@ -799,3 +799,221 @@ fn trim_idle_releases_scratch_fbos_without_invalidating_cached_static_blur() {
     target.destroy(&egl.gl);
     programs.destroy(&egl.gl);
 }
+
+#[test]
+fn cross_mode_transition_preserves_old_parallax_geometry_until_complete() {
+    let egl = EglContext::new_headless().expect("headless EGL context");
+    let programs = ShaderPrograms::compile(&egl.gl, egl.is_gles).expect("compile shaders");
+    let target = OffscreenTarget::new(&egl.gl, 128, 96);
+
+    // Wide 512x96 frames on 128x96 viewport:
+    // - Centered normal (mode_blend = 0.0) samples columns [192..320]: left=half0, right=half1.
+    // - Parallax at progress = 1.0 (mode_blend = 1.0) samples [384..512]: entire viewport = half1.
+    // - Parallax at progress = 0.0 (mode_blend = 1.0) samples [0..128]: entire viewport = half0.
+    let old_frame =
+        split_left_right_rgba("old-wide", 0, 512, 96, [255, 0, 0, 255], [0, 255, 0, 255]);
+    let new_frame =
+        split_left_right_rgba("new-wide", 0, 512, 96, [0, 0, 255, 255], [255, 255, 0, 255]);
+
+    // 1. Parallax (mode_blend = 1.0, progress = 1.0) -> Normal (Some(false)) across Wipe, Fade, Grow.
+    for effect in [
+        TransitionEffect::Wipe,
+        TransitionEffect::Fade,
+        TransitionEffect::Grow,
+    ] {
+        let mut layer = LayerPipeline::new(LayerRole::Wallpaper, true);
+        layer.set_progress(1.0, 0);
+        layer
+            .apply_frame(&egl.gl, &old_frame, TransitionSpec::instant(), egl.bgra_ext_supported)
+            .unwrap();
+        assert!((layer.mode_blend() - 1.0).abs() < 1e-5);
+        assert!((layer.old_mode_blend() - 1.0).abs() < 1e-5);
+
+        let spec = TransitionSpec {
+            effect,
+            duration_ms: 1000,
+            angle_deg: 0.0, // right-to-left wipe: x=0.95 incoming, x=0.10 outgoing
+            position: [0.5, 0.5],
+            wave: [20.0, 20.0],
+        };
+        layer
+            .apply_frame_with_mode(&egl.gl, &new_frame, spec, Some(false), egl.bgra_ext_supported)
+            .unwrap();
+        assert!(layer.is_transition_active());
+        assert!((layer.old_mode_blend() - 1.0).abs() < 1e-5);
+        assert!(layer.mode_blend().abs() < 1e-5);
+
+        // t = 0.0: outgoing slot must remain at parallax (all green), NOT snapped to centered (left red).
+        layer
+            .render(
+                &egl.gl,
+                &programs,
+                Some(target.fbo),
+                128,
+                96,
+                1.12,
+                KawaseSettings::default(),
+            )
+            .unwrap();
+        assert_near_rgb(target.read_pixel_top_down(&egl.gl, 0.1, 0.5), 0.0, 1.0, 0.0);
+        assert_near_rgb(target.read_pixel_top_down(&egl.gl, 0.9, 0.5), 0.0, 1.0, 0.0);
+
+        // Mid-transition (~25% -> ~50%): old_mode_blend stays 1.0 while mode_blend stays 0.0.
+        layer.tick(&egl.gl, 0.25);
+        layer.tick(&egl.gl, 0.20);
+        assert!(layer.is_transition_active());
+        assert!((layer.old_mode_blend() - 1.0).abs() < 1e-5);
+        assert!(layer.mode_blend().abs() < 1e-5);
+        layer
+            .render(
+                &egl.gl,
+                &programs,
+                Some(target.fbo),
+                128,
+                96,
+                1.12,
+                KawaseSettings::default(),
+            )
+            .unwrap();
+
+        match effect {
+            TransitionEffect::Wipe => {
+                // Outgoing left stays parallax green (NOT centered red); incoming right is centered yellow.
+                assert_near_rgb(target.read_pixel_top_down(&egl.gl, 0.05, 0.5), 0.0, 1.0, 0.0);
+                assert_near_rgb(target.read_pixel_top_down(&egl.gl, 0.95, 0.5), 1.0, 1.0, 0.0);
+            }
+            TransitionEffect::Fade => {
+                // Left mixes outgoing parallax green + incoming centered blue (red channel stays ~0).
+                let px = target.read_pixel_top_down(&egl.gl, 0.1, 0.5);
+                assert!(
+                    px[0] < 0.05 && px[1] > 0.30 && px[2] > 0.30,
+                    "fade left should blend parallax green + normal blue, got {px:?}"
+                );
+            }
+            TransitionEffect::Grow => {
+                // Corner stays outgoing parallax green (NOT centered red).
+                assert_near_rgb(target.read_pixel_top_down(&egl.gl, 0.05, 0.05), 0.0, 1.0, 0.0);
+                // Center-right inside grow circle is incoming centered yellow.
+                assert_near_rgb(target.read_pixel_top_down(&egl.gl, 0.55, 0.5), 1.0, 1.0, 0.0);
+            }
+            _ => unreachable!(),
+        }
+
+        // Complete transition: old_mode_blend syncs to 0.0 and output matches centered normal new_frame.
+        for _ in 0..4 {
+            layer.tick(&egl.gl, 0.20);
+        }
+        assert!(!layer.is_transition_active());
+        assert!(layer.old_mode_blend().abs() < 1e-5);
+        assert!(layer.mode_blend().abs() < 1e-5);
+        layer
+            .render(
+                &egl.gl,
+                &programs,
+                Some(target.fbo),
+                128,
+                96,
+                1.12,
+                KawaseSettings::default(),
+            )
+            .unwrap();
+        assert_near_rgb(target.read_pixel_top_down(&egl.gl, 0.1, 0.5), 0.0, 0.0, 1.0);
+        assert_near_rgb(target.read_pixel_top_down(&egl.gl, 0.9, 0.5), 1.0, 1.0, 0.0);
+        layer.release_all(&egl.gl);
+    }
+
+    // 2. Reverse direction: Normal (mode_blend = 0.0) -> Parallax (Some(true)) with Wipe.
+    //    Check both progress = 1.0 (outgoing left stays red instead of snapping to green)
+    //    and progress = 0.0 (incoming right renders parallax blue instead of centered yellow).
+    for progress in [1.0_f32, 0.0_f32] {
+        let mut layer = LayerPipeline::new(LayerRole::Wallpaper, false);
+        layer.set_progress(progress, 0);
+        layer
+            .apply_frame(&egl.gl, &old_frame, TransitionSpec::instant(), egl.bgra_ext_supported)
+            .unwrap();
+        assert!(layer.mode_blend().abs() < 1e-5);
+        assert!(layer.old_mode_blend().abs() < 1e-5);
+
+        let spec = TransitionSpec {
+            effect: TransitionEffect::Wipe,
+            duration_ms: 1000,
+            angle_deg: 0.0,
+            position: [0.5, 0.5],
+            wave: [20.0, 20.0],
+        };
+        layer
+            .apply_frame_with_mode(&egl.gl, &new_frame, spec, Some(true), egl.bgra_ext_supported)
+            .unwrap();
+        assert!(layer.is_transition_active());
+        assert!(layer.old_mode_blend().abs() < 1e-5);
+        assert!((layer.mode_blend() - 1.0).abs() < 1e-5);
+
+        // t = 0.0: outgoing stays centered normal (left=red, right=green).
+        layer
+            .render(
+                &egl.gl,
+                &programs,
+                Some(target.fbo),
+                128,
+                96,
+                1.12,
+                KawaseSettings::default(),
+            )
+            .unwrap();
+        assert_near_rgb(target.read_pixel_top_down(&egl.gl, 0.1, 0.5), 1.0, 0.0, 0.0);
+        assert_near_rgb(target.read_pixel_top_down(&egl.gl, 0.9, 0.5), 0.0, 1.0, 0.0);
+
+        // Mid-transition: outgoing left stays centered red; incoming right is parallax-positioned.
+        layer.tick(&egl.gl, 0.25);
+        layer.tick(&egl.gl, 0.20);
+        assert!(layer.old_mode_blend().abs() < 1e-5);
+        assert!((layer.mode_blend() - 1.0).abs() < 1e-5);
+        layer
+            .render(
+                &egl.gl,
+                &programs,
+                Some(target.fbo),
+                128,
+                96,
+                1.12,
+                KawaseSettings::default(),
+            )
+            .unwrap();
+        assert_near_rgb(target.read_pixel_top_down(&egl.gl, 0.05, 0.5), 1.0, 0.0, 0.0);
+        if progress > 0.5 {
+            assert_near_rgb(target.read_pixel_top_down(&egl.gl, 0.95, 0.5), 1.0, 1.0, 0.0);
+        } else {
+            assert_near_rgb(target.read_pixel_top_down(&egl.gl, 0.95, 0.5), 0.0, 0.0, 1.0);
+        }
+
+        // Complete transition: old_mode_blend syncs to 1.0 and entire viewport is parallax new_frame.
+        for _ in 0..4 {
+            layer.tick(&egl.gl, 0.20);
+        }
+        assert!(!layer.is_transition_active());
+        assert!((layer.old_mode_blend() - 1.0).abs() < 1e-5);
+        assert!((layer.mode_blend() - 1.0).abs() < 1e-5);
+        layer
+            .render(
+                &egl.gl,
+                &programs,
+                Some(target.fbo),
+                128,
+                96,
+                1.12,
+                KawaseSettings::default(),
+            )
+            .unwrap();
+        if progress > 0.5 {
+            assert_near_rgb(target.read_pixel_top_down(&egl.gl, 0.1, 0.5), 1.0, 1.0, 0.0);
+            assert_near_rgb(target.read_pixel_top_down(&egl.gl, 0.9, 0.5), 1.0, 1.0, 0.0);
+        } else {
+            assert_near_rgb(target.read_pixel_top_down(&egl.gl, 0.1, 0.5), 0.0, 0.0, 1.0);
+            assert_near_rgb(target.read_pixel_top_down(&egl.gl, 0.9, 0.5), 0.0, 0.0, 1.0);
+        }
+        layer.release_all(&egl.gl);
+    }
+
+    target.destroy(&egl.gl);
+    programs.destroy(&egl.gl);
+}
