@@ -6,6 +6,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use bgpicker_core::niri::{NiriClientConfig, NiriWatcher};
 use bgpicker_core::paths::{BgPickerPaths, EngineKind, PersistedState};
 use bgpicker_core::protocol::Request;
+use bgpicker_core::splash::trace_startup;
 use bgpicker_core::{is_splash_lock_held, resolve_startup_placeholders};
 use bgpicker_gfx::StartupSplashSpec;
 
@@ -86,8 +87,10 @@ impl DaemonInstance {
     /// Starts the live daemon backed by Wayland+EGL (`GfxRendererBackend`) and FFmpeg (`RealVideoBackend`).
     pub fn start_live(opts: DaemonOptions) -> Result<Self, String> {
         let splash = resolve_in_process_splash(&opts);
+        trace_startup("splash_resolved", format_args!("enabled={}", splash.is_some()));
         let renderer: Arc<dyn RendererBackend> =
             Arc::new(GfxRendererBackend::connect_with_splash(splash)?);
+        trace_startup("renderer_ready", "");
         let video: Arc<dyn VideoBackend> = Arc::new(RealVideoBackend::new(Arc::clone(&renderer)));
         Self::start_with_backends(opts, renderer, video)
     }

@@ -2,6 +2,7 @@
 //! `bgpicker-daemon` (background cache writer) and `bgpicker-splash` (zero-decode
 //! Wayland `wl_shm` boot placeholder renderer).
 
+use std::fmt::Display;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -18,6 +19,26 @@ use crate::paths::{atomic_write, BgPickerPaths, EngineKind, PersistedState};
 pub const SPLASH_BIN_MAGIC: &[u8; 4] = b"BGPX";
 pub const SPLASH_HEADER_BYTES: usize = 12;
 const MAX_SPLASH_DIM: u32 = 16384;
+
+/// Records a startup milestone on the same monotonic clock used by `journalctl -o short-monotonic`.
+pub fn write_startup_trace(mut output: impl Write, event: &str, fields: impl Display) {
+    let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } == 0 {
+        let _ = writeln!(
+            output,
+            "bgpicker-startup mono={}.{:09} pid={} event={} {}",
+            time.tv_sec,
+            time.tv_nsec,
+            std::process::id(),
+            event,
+            fields,
+        );
+    }
+}
+
+pub fn trace_startup(event: &str, fields: impl Display) {
+    write_startup_trace(io::stderr().lock(), event, fields);
+}
 
 /// Computes scaled buffer dimensions from a logical surface size and 1/120th
 /// Wayland fractional scale factor (`180` = `1.5x`).
@@ -397,6 +418,17 @@ pub fn try_load_bgpx_exact_into_memfd(
     if w != target_w || h != target_h {
         return Ok(None);
     }
+    read_bgpx_pixels_into_memfd(&mut file, w, h).map(Some)
+}
+
+/// Streams a validated BGPX bitmap into `wl_shm` shared memory at its stored size.
+pub fn load_bgpx_into_memfd(bin_path: &Path) -> io::Result<MemfdBuffer> {
+    let mut file = File::open(bin_path)?;
+    let (w, h) = read_splash_header(&mut file)?;
+    read_bgpx_pixels_into_memfd(&mut file, w, h)
+}
+
+fn read_bgpx_pixels_into_memfd(file: &mut File, w: u32, h: u32) -> io::Result<MemfdBuffer> {
     let byte_len = (w as usize)
         .checked_mul(h as usize)
         .and_then(|p| p.checked_mul(4))
@@ -407,12 +439,12 @@ pub fn try_load_bgpx_exact_into_memfd(
         let mut map = MmapGuard::new(fd.as_raw_fd(), byte_len)?;
         file.read_exact(map.as_mut_slice())?;
     }
-    Ok(Some(MemfdBuffer {
+    Ok(MemfdBuffer {
         fd,
         byte_len,
         width: w,
         height: h,
-    }))
+    })
 }
 
 /// Exclusive non-blocking advisory lock held by the active `bgpicker-splash` process.

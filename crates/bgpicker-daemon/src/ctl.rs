@@ -22,6 +22,7 @@ use bgpicker_core::protocol::{
     ModeAction, PickerCommand, PickerIpcClient, ProtocolError, Request, ResponseData,
     VideoModeAction,
 };
+use bgpicker_core::splash::write_startup_trace;
 use bgpicker_gfx::{FrameInput, PixelFormat};
 
 use crate::daemon::resolve_project_dir;
@@ -1318,6 +1319,7 @@ fn ensure_daemon_live(
     let log_err = log_file.try_clone().map_err(|e| e.to_string())?;
 
     let daemon_bin = resolve_daemon_binary();
+    write_startup_trace(&log_file, "daemon_spawn_requested", "");
     let mut cmd = Command::new(&daemon_bin);
     cmd.arg("--socket")
         .arg(paths.daemon_socket_path())

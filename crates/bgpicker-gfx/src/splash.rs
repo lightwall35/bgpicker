@@ -5,18 +5,21 @@
 //! `EglContext::new_wayland` runs, then destroys those temporary surfaces once
 //! `bgpicker:wallpaper` presents its first real compositor-acknowledged EGL frame.
 
-use std::collections::HashMap;
 use std::fs::File;
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use bgpicker_core::splash::{load_bgpx_into_memfd, trace_startup};
 use bgpicker_core::{
     MemfdBuffer, compute_scaled_size_120, cover_fill_to_xrgb8888, read_splash_header,
-    try_load_bgpx_exact_into_memfd, write_pixels_to_memfd,
+    write_pixels_to_memfd,
 };
 use image::ImageReader;
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::io::Errno;
+use wayland_client::backend::WaylandError;
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_buffer::{self, WlBuffer};
 use wayland_client::protocol::wl_compositor::WlCompositor;
@@ -26,10 +29,14 @@ use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_shm::{self, WlShm};
 use wayland_client::protocol::wl_shm_pool::WlShmPool;
 use wayland_client::protocol::wl_surface::{self, WlSurface};
-use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
+use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
     wp_fractional_scale_v1::{self, WpFractionalScaleV1},
+};
+use wayland_protocols::wp::presentation_time::client::{
+    wp_presentation::{self, WpPresentation},
+    wp_presentation_feedback::{self, WpPresentationFeedback},
 };
 use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
@@ -41,6 +48,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 
 const FG_NAMESPACE: &str = "bgpick-fg";
 const BG_NAMESPACE: &str = "wallpaper";
+const SPLASH_WAIT: Duration = Duration::from_millis(250);
 
 /// Input media paths for the in-process pre-EGL `wl_shm` boot splash.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -63,6 +71,7 @@ struct OutputInfo {
 
 struct SplashSlot {
     role: SlotRole,
+    output: WlOutput,
     surface: WlSurface,
     layer_surface: ZwlrLayerSurfaceV1,
     viewport: Option<WpViewport>,
@@ -70,8 +79,10 @@ struct SplashSlot {
     logical_width: u32,
     logical_height: u32,
     scale_120: u32,
+    has_preferred_scale: bool,
     configured: bool,
-    rendered_size: Option<(u32, u32)>,
+    rendered_geometry: Option<(u32, u32, u32)>,
+    presented: bool,
     active_pool: Option<WlShmPool>,
     active_buffer: Option<WlBuffer>,
 }
@@ -95,8 +106,10 @@ impl SplashSlot {
         }
 
         let viewport = viewporter.map(|vp| vp.get_viewport(&surface, qh, ()));
-        let fractional_scale =
-            fractional_mgr.map(|mgr| mgr.get_fractional_scale(&surface, qh, surface.clone()));
+        let fractional_scale = viewport
+            .as_ref()
+            .and(fractional_mgr)
+            .map(|mgr| mgr.get_fractional_scale(&surface, qh, surface.clone()));
 
         if viewport.is_some() {
             surface.set_buffer_scale(1);
@@ -108,8 +121,14 @@ impl SplashSlot {
             SlotRole::Foreground => FG_NAMESPACE,
             SlotRole::Backdrop => BG_NAMESPACE,
         };
-        let layer_surface =
-            layer_shell.get_layer_surface(&surface, Some(output), Layer::Background, ns.into(), qh, ());
+        let layer_surface = layer_shell.get_layer_surface(
+            &surface,
+            Some(output),
+            Layer::Background,
+            ns.into(),
+            qh,
+            (),
+        );
         layer_surface.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
         layer_surface.set_exclusive_zone(-1);
         layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
@@ -118,6 +137,7 @@ impl SplashSlot {
 
         Self {
             role,
+            output: output.clone(),
             surface,
             layer_surface,
             viewport,
@@ -125,8 +145,10 @@ impl SplashSlot {
             logical_width: 0,
             logical_height: 0,
             scale_120: (initial_scale.max(1) as u32) * 120,
+            has_preferred_scale: false,
             configured: false,
-            rendered_size: None,
+            rendered_geometry: None,
+            presented: false,
             active_pool: None,
             active_buffer: None,
         }
@@ -157,13 +179,13 @@ struct SplashState {
     layer_shell: ZwlrLayerShellV1,
     viewporter: Option<WpViewporter>,
     fractional_mgr: Option<WpFractionalScaleManagerV1>,
+    presentation: Option<WpPresentation>,
+    presentation_clock: Option<u32>,
+    foreground_bitmap: Option<MemfdBuffer>,
     empty_region: Option<WlRegion>,
     qh: QueueHandle<Self>,
     outputs: Vec<OutputInfo>,
-    output_indices_by_name: HashMap<u32, usize>,
     slots: Vec<SplashSlot>,
-    foreground_rendered: bool,
-    backdrop_spawned: bool,
 }
 
 impl SplashState {
@@ -185,45 +207,71 @@ impl SplashState {
     }
 
     fn render_ready_slots(&mut self, conn: &Connection) {
-        let mut newly_committed_fg = false;
         for slot in &mut self.slots {
             if !slot.configured || slot.logical_width == 0 || slot.logical_height == 0 {
                 continue;
             }
             let (pw, ph) =
                 compute_scaled_size_120(slot.logical_width, slot.logical_height, slot.scale_120);
-            if slot.rendered_size == Some((pw, ph)) {
+            let bitmap = self.foreground_bitmap.as_ref().filter(|bitmap| {
+                slot.role == SlotRole::Foreground
+                    && ((bitmap.width(), bitmap.height()) == (pw, ph)
+                        || (slot.viewport.is_some()
+                            && same_aspect((bitmap.width(), bitmap.height()), (pw, ph))))
+            });
+            let scale_key = if bitmap.is_some() && slot.viewport.is_some() {
+                0 // Fractional scale changes reuse the same buffer and logical destination.
+            } else {
+                slot.scale_120
+            };
+            let geometry = (slot.logical_width, slot.logical_height, scale_key);
+            if slot.rendered_geometry == Some(geometry) {
                 continue;
             }
+            slot.rendered_geometry = Some(geometry);
 
-            let memfd = match slot.role {
-                SlotRole::Foreground => load_splash_into_memfd(
-                    self.spec.fg_bin.as_deref(),
-                    self.spec.fg_image.as_deref(),
-                    pw,
-                    ph,
-                ),
-                SlotRole::Backdrop => {
-                    load_splash_into_memfd(None, self.spec.bg_image.as_deref(), pw, ph)
+            let load_started = Instant::now();
+            let loaded;
+            let (memfd, source) = if let Some(bitmap) = bitmap {
+                (bitmap, "bgpx")
+            } else {
+                let (bin, image) = match slot.role {
+                    SlotRole::Foreground => {
+                        (self.spec.fg_bin.as_deref(), self.spec.fg_image.as_deref())
+                    }
+                    SlotRole::Backdrop => (None, self.spec.bg_image.as_deref()),
+                };
+                match load_splash_fallback(bin, image, pw, ph) {
+                    Ok((memfd, source)) => {
+                        loaded = memfd;
+                        (&loaded, source)
+                    }
+                    Err(err) => {
+                        trace_startup(
+                            "shm_buffer_failed",
+                            format_args!("role={:?} error={err}", slot.role),
+                        );
+                        continue;
+                    }
                 }
-            };
-
-            let Ok(memfd) = memfd else {
-                slot.rendered_size = Some((pw, ph));
-                continue;
             };
 
             if let Some(ref vp) = slot.viewport {
                 slot.surface.set_buffer_scale(1);
+                if bitmap.is_some() {
+                    set_viewport_crop(vp, memfd, slot.logical_width, slot.logical_height);
+                } else {
+                    vp.set_source(-1.0, -1.0, -1.0, -1.0);
+                }
                 vp.set_destination(slot.logical_width as i32, slot.logical_height as i32);
             } else {
                 let int_scale = (slot.scale_120 / 120).max(1) as i32;
                 slot.surface.set_buffer_scale(int_scale);
             }
 
-            let pool = self
-                .shm
-                .create_pool(memfd.fd().as_fd(), memfd.byte_len() as i32, &self.qh, ());
+            let pool =
+                self.shm
+                    .create_pool(memfd.fd().as_fd(), memfd.byte_len() as i32, &self.qh, ());
             let buffer = pool.create_buffer(
                 0,
                 memfd.width() as i32,
@@ -239,11 +287,30 @@ impl SplashState {
                 region.add(0, 0, slot.logical_width as i32, slot.logical_height as i32);
                 slot.surface.set_opaque_region(Some(&region));
                 region.destroy();
+                if !slot.presented
+                    && let Some(presentation) = &self.presentation
+                {
+                    presentation.feedback(&slot.surface, &self.qh, slot.surface.clone());
+                }
             }
 
             slot.surface.attach(Some(&buffer), 0, 0);
-            slot.surface.damage_buffer(0, 0, pw as i32, ph as i32);
+            slot.surface
+                .damage_buffer(0, 0, memfd.width() as i32, memfd.height() as i32);
             slot.surface.commit();
+            // Send each output as soon as it is ready, including ahead of any image decode on another output.
+            let _ = conn.flush();
+            trace_startup(
+                "shm_commit",
+                format_args!(
+                    "role={:?} surface={} source={source} buffer={}x{} target={pw}x{ph} load_ms={:.2}",
+                    slot.role,
+                    slot.surface.id().protocol_id(),
+                    memfd.width(),
+                    memfd.height(),
+                    load_started.elapsed().as_secs_f64() * 1000.0,
+                ),
+            );
 
             if let Some(old_buf) = slot.active_buffer.replace(buffer) {
                 old_buf.destroy();
@@ -251,56 +318,103 @@ impl SplashState {
             if let Some(old_pool) = slot.active_pool.replace(pool) {
                 old_pool.destroy();
             }
-            slot.rendered_size = Some((pw, ph));
-            if slot.role == SlotRole::Foreground {
-                newly_committed_fg = true;
-            }
         }
+    }
 
-        if newly_committed_fg {
-            self.foreground_rendered = true;
-            let _ = conn.flush();
-            if !self.backdrop_spawned
-                && self.spec.bg_image.as_ref().is_some_and(|p| p.is_file())
+    fn dispatch_until(
+        &mut self,
+        conn: &Connection,
+        queue: &mut EventQueue<Self>,
+        deadline: Instant,
+        ready: impl Fn(&Self) -> bool,
+    ) -> Result<bool, String> {
+        loop {
+            queue
+                .dispatch_pending(self)
+                .map_err(|err| err.to_string())?;
+            self.render_ready_slots(conn);
+            if ready(self) {
+                return Ok(true);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            let interest = match queue.flush() {
+                Ok(()) => PollFlags::IN,
+                Err(WaylandError::Io(err)) if err.kind() == ErrorKind::WouldBlock => {
+                    PollFlags::IN | PollFlags::OUT
+                }
+                Err(err) => return Err(err.to_string()),
+            };
+            let Some(read) = queue.prepare_read() else {
+                continue;
+            };
+            let mut fds = [PollFd::new(queue, interest)];
+            let timeout = Timespec::try_from(remaining).map_err(|err| err.to_string())?;
+            match poll(&mut fds, Some(&timeout)) {
+                Ok(0) => return Ok(false),
+                Ok(_) => {}
+                Err(Errno::INTR) => continue,
+                Err(err) => return Err(err.to_string()),
+            }
+            if fds[0]
+                .revents()
+                .intersects(PollFlags::IN | PollFlags::ERR | PollFlags::HUP)
             {
-                self.backdrop_spawned = true;
-                self.spawn_role_slots(SlotRole::Backdrop);
-                let _ = conn.flush();
+                match read.read() {
+                    Ok(_) => {}
+                    Err(WaylandError::Io(err)) if err.kind() == ErrorKind::WouldBlock => {}
+                    Err(err) => return Err(err.to_string()),
+                }
             }
         }
+    }
+
+    fn has_buffer(&self, role: SlotRole) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| slot.role == role && slot.active_buffer.is_some())
     }
 }
 
 /// Active in-process `wl_shm` splash surfaces kept displayed until EGL Frame 1 presents.
 pub(crate) struct ActiveSplash {
     conn: Connection,
-    _queue: EventQueue<SplashState>,
+    queue: EventQueue<SplashState>,
     state: SplashState,
 }
 
 impl ActiveSplash {
     /// Displays `spec` synchronously on `conn` via `wl_shm` before EGL/GL initialization.
     pub(crate) fn show(conn: &Connection, spec: &StartupSplashSpec) -> Option<Self> {
+        trace_startup("shm_start", "");
         let have_fg = spec.fg_bin.as_ref().is_some_and(|p| p.is_file())
             || spec.fg_image.as_ref().is_some_and(|p| p.is_file());
         let have_bg = spec.bg_image.as_ref().is_some_and(|p| p.is_file());
         if !have_fg && !have_bg {
+            trace_startup("splash_gate", "result=no_media");
             return None;
         }
 
-        let (globals, mut queue) = registry_queue_init::<SplashState>(conn).ok()?;
+        let (globals, mut queue) = registry_queue_init::<SplashState>(conn)
+            .inspect_err(|err| trace_startup("shm_registry_failed", format_args!("error={err}")))
+            .ok()?;
+        trace_startup("shm_registry_ready", "");
         let qh = queue.handle();
 
         let compositor = globals.bind::<WlCompositor, _, _>(&qh, 1..=6, ()).ok()?;
         let shm = globals.bind::<WlShm, _, _>(&qh, 1..=1, ()).ok()?;
-        let layer_shell = globals.bind::<ZwlrLayerShellV1, _, _>(&qh, 1..=4, ()).ok()?;
+        let layer_shell = globals
+            .bind::<ZwlrLayerShellV1, _, _>(&qh, 1..=4, ())
+            .ok()?;
         let viewporter = globals.bind::<WpViewporter, _, _>(&qh, 1..=1, ()).ok();
         let fractional_mgr = globals
             .bind::<WpFractionalScaleManagerV1, _, _>(&qh, 1..=1, ())
             .ok();
+        let presentation = globals.bind::<WpPresentation, _, _>(&qh, 1..=2, ()).ok();
 
         let mut outputs = Vec::new();
-        let mut output_indices_by_name = HashMap::new();
         globals.contents().with_list(|list| {
             for global in list {
                 if global.interface == "wl_output" {
@@ -308,15 +422,20 @@ impl ActiveSplash {
                         globals
                             .registry()
                             .bind(global.name, global.version.min(4), &qh, ());
-                    let idx = outputs.len();
                     outputs.push(OutputInfo {
                         proxy,
                         integer_scale: 1,
                     });
-                    output_indices_by_name.insert(global.name, idx);
                 }
             }
         });
+        if outputs.is_empty() {
+            if let Some(presentation) = presentation {
+                presentation.destroy();
+            }
+            trace_startup("splash_gate", "result=no_output");
+            return None;
+        }
 
         let empty_region = Some(compositor.create_region(&qh, ()));
         let mut state = SplashState {
@@ -326,51 +445,93 @@ impl ActiveSplash {
             layer_shell,
             viewporter,
             fractional_mgr,
+            presentation,
+            presentation_clock: None,
+            foreground_bitmap: None,
             empty_region,
             qh,
             outputs,
-            output_indices_by_name,
             slots: Vec::new(),
-            foreground_rendered: false,
-            backdrop_spawned: false,
         };
 
-        let _ = queue.roundtrip(&mut state);
-        if state.outputs.is_empty() {
-            return None;
+        let role = if have_fg {
+            SlotRole::Foreground
+        } else {
+            SlotRole::Backdrop
+        };
+        state.spawn_role_slots(role);
+        let _ = conn.flush();
+        if let Some(bin) = spec.fg_bin.as_deref() {
+            let started = Instant::now();
+            match load_bgpx_into_memfd(bin) {
+                Ok(bitmap) => {
+                    trace_startup(
+                        "shm_cache",
+                        format_args!(
+                            "result=hit size={}x{} read_ms={:.2}",
+                            bitmap.width(),
+                            bitmap.height(),
+                            started.elapsed().as_secs_f64() * 1000.0,
+                        ),
+                    );
+                    state.foreground_bitmap = Some(bitmap);
+                }
+                Err(err) => trace_startup("shm_cache", format_args!("result=fallback error={err}")),
+            }
+        } else if have_fg {
+            trace_startup("shm_cache", "result=unavailable");
         }
 
-        if have_fg {
-            state.spawn_role_slots(SlotRole::Foreground);
-        } else if have_bg {
-            state.backdrop_spawned = true;
+        let committed =
+            state.dispatch_until(conn, &mut queue, Instant::now() + SPLASH_WAIT, |state| {
+                state.has_buffer(role)
+            });
+        let present_deadline = Instant::now() + SPLASH_WAIT;
+        let gate_result = match committed {
+            Ok(false) => "buffer_timeout",
+            Ok(true) if !have_fg => "backdrop_only",
+            Ok(true) if state.presentation.is_none() => "presentation_unsupported",
+            Ok(true) => match state.dispatch_until(conn, &mut queue, present_deadline, |state| {
+                state.slots.iter().any(|slot| slot.presented)
+            }) {
+                Ok(true) => "presented",
+                Ok(false) => "presentation_timeout",
+                Err(err) => {
+                    trace_startup("shm_wait_failed", format_args!("error={err}"));
+                    "wayland_error"
+                }
+            },
+            Err(err) => {
+                trace_startup("shm_wait_failed", format_args!("error={err}"));
+                "wayland_error"
+            }
+        };
+        trace_startup("splash_gate", format_args!("result={gate_result}"));
+
+        // Prepare the overview behind an already presented foreground using the remaining wait budget.
+        if have_fg && have_bg && matches!(gate_result, "presented" | "presentation_unsupported") {
             state.spawn_role_slots(SlotRole::Backdrop);
-        }
-
-        // Bound roundtrips so Frame 1 reaches the compositor fast without stalling headless boots.
-        let deadline = Instant::now() + Duration::from_millis(250);
-        while Instant::now() < deadline {
-            if queue.roundtrip(&mut state).is_err() {
-                break;
-            }
-            if (!have_fg || state.foreground_rendered)
-                && (!have_bg
-                    || state
-                        .slots
-                        .iter()
-                        .filter(|s| s.role == SlotRole::Backdrop)
-                        .all(|s| s.rendered_size.is_some()))
-            {
-                break;
-            }
+            let _ = state.dispatch_until(conn, &mut queue, present_deadline, |state| {
+                state.has_buffer(SlotRole::Backdrop)
+            });
         }
         let _ = conn.flush();
 
         Some(Self {
             conn: conn.clone(),
-            _queue: queue,
+            queue,
             state,
         })
+    }
+
+    pub(crate) fn dispatch_pending(&mut self) {
+        if self
+            .queue
+            .dispatch_pending(&mut self.state)
+            .is_ok_and(|count| count > 0)
+        {
+            self.state.render_ready_slots(&self.conn);
+        }
     }
 
     pub(crate) fn retire(mut self) {
@@ -384,6 +545,9 @@ impl ActiveSplash {
         if let Some(region) = self.state.empty_region.take() {
             region.destroy();
         }
+        if let Some(presentation) = self.state.presentation.take() {
+            presentation.destroy();
+        }
         let _ = self.conn.flush();
     }
 }
@@ -394,18 +558,29 @@ impl Drop for ActiveSplash {
     }
 }
 
-fn load_splash_into_memfd(
+fn same_aspect(first: (u32, u32), second: (u32, u32)) -> bool {
+    let (w1, h1) = (u64::from(first.0), u64::from(first.1));
+    let (w2, h2) = (u64::from(second.0), u64::from(second.1));
+    // Pixel rounding on both axes can differ by one between logical and scaled sizes.
+    (w1 * h2).abs_diff(w2 * h1) <= w1.max(w2) + h1.max(h2)
+}
+
+fn set_viewport_crop(viewport: &WpViewport, bitmap: &MemfdBuffer, target_w: u32, target_h: u32) {
+    let (w, h) = (f64::from(bitmap.width()), f64::from(bitmap.height()));
+    let target_w = f64::from(target_w);
+    let target_h = f64::from(target_h);
+    let scale = (w / target_w).min(h / target_h);
+    let crop_w = (target_w * scale).min(w);
+    let crop_h = (target_h * scale).min(h);
+    viewport.set_source((w - crop_w) * 0.5, (h - crop_h) * 0.5, crop_w, crop_h);
+}
+
+fn load_splash_fallback(
     bin_path: Option<&Path>,
     image_path: Option<&Path>,
     target_w: u32,
     target_h: u32,
-) -> Result<MemfdBuffer, String> {
-    if let Some(bp) = bin_path
-        && let Ok(Some(buf)) = try_load_bgpx_exact_into_memfd(bp, target_w, target_h)
-    {
-        return Ok(buf);
-    }
-
+) -> Result<(MemfdBuffer, &'static str), String> {
     if let Some(ip) = image_path
         && ip.is_file()
     {
@@ -430,7 +605,9 @@ fn load_splash_into_memfd(
             &mut pixels,
         )
         .map_err(|e| e.to_string())?;
-        return write_pixels_to_memfd(target_w, target_h, &pixels).map_err(|e| e.to_string());
+        return write_pixels_to_memfd(target_w, target_h, &pixels)
+            .map(|memfd| (memfd, "image"))
+            .map_err(|e| e.to_string());
     }
 
     if let Some(bp) = bin_path
@@ -443,7 +620,9 @@ fn load_splash_into_memfd(
             let mut pixels = Vec::new();
             cover_fill_to_xrgb8888(sw, sh, sw * 4, &src, true, target_w, target_h, &mut pixels)
                 .map_err(|e| e.to_string())?;
-            return write_pixels_to_memfd(target_w, target_h, &pixels).map_err(|e| e.to_string());
+            return write_pixels_to_memfd(target_w, target_h, &pixels)
+                .map(|memfd| (memfd, "resampled_bgpx"))
+                .map_err(|e| e.to_string());
         }
     }
 
@@ -467,12 +646,10 @@ impl Dispatch<WlRegistry, GlobalListContents> for SplashState {
             && interface == "wl_output"
         {
             let proxy: WlOutput = registry.bind(name, version.min(4), qh, ());
-            let idx = state.outputs.len();
             state.outputs.push(OutputInfo {
                 proxy,
                 integer_scale: 1,
             });
-            state.output_indices_by_name.insert(name, idx);
         }
     }
 }
@@ -562,6 +739,11 @@ impl Dispatch<WlOutput, ()> for SplashState {
             && let Some(out) = state.outputs.iter_mut().find(|o| &o.proxy == proxy)
         {
             out.integer_scale = factor.max(1);
+            for slot in &mut state.slots {
+                if slot.output == *proxy && !slot.has_preferred_scale {
+                    slot.scale_120 = (out.integer_scale as u32) * 120;
+                }
+            }
         }
     }
 }
@@ -584,7 +766,7 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for SplashState {
         proxy: &ZwlrLayerSurfaceV1,
         event: zwlr_layer_surface_v1::Event,
         _data: &(),
-        conn: &Connection,
+        _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
         if let zwlr_layer_surface_v1::Event::Configure {
@@ -599,7 +781,60 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for SplashState {
                 slot.logical_height = height;
                 slot.configured = true;
             }
-            state.render_ready_slots(conn);
+        }
+    }
+}
+
+impl Dispatch<WpPresentation, ()> for SplashState {
+    fn event(
+        state: &mut Self,
+        _proxy: &WpPresentation,
+        event: wp_presentation::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wp_presentation::Event::ClockId { clk_id } = event {
+            state.presentation_clock = Some(clk_id);
+        }
+    }
+}
+
+impl Dispatch<WpPresentationFeedback, WlSurface> for SplashState {
+    fn event(
+        state: &mut Self,
+        _proxy: &WpPresentationFeedback,
+        event: wp_presentation_feedback::Event,
+        surface: &WlSurface,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let id = surface.id().protocol_id();
+        match event {
+            wp_presentation_feedback::Event::Presented {
+                tv_sec_hi,
+                tv_sec_lo,
+                tv_nsec,
+                ..
+            } => {
+                if let Some(slot) = state.slots.iter_mut().find(|slot| slot.surface == *surface)
+                    && !slot.presented
+                {
+                    slot.presented = true;
+                    let seconds = (u64::from(tv_sec_hi) << 32) | u64::from(tv_sec_lo);
+                    trace_startup(
+                        "shm_presented",
+                        format_args!(
+                            "surface={id} display_time={seconds}.{tv_nsec:09} display_clock={:?}",
+                            state.presentation_clock,
+                        ),
+                    );
+                }
+            }
+            wp_presentation_feedback::Event::Discarded => {
+                trace_startup("shm_discarded", format_args!("surface={id}"));
+            }
+            _ => {}
         }
     }
 }
@@ -646,20 +881,14 @@ impl Dispatch<WpFractionalScaleV1, WlSurface> for SplashState {
         _proxy: &WpFractionalScaleV1,
         event: wp_fractional_scale_v1::Event,
         surface: &WlSurface,
-        conn: &Connection,
+        _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
-            let mut changed = false;
-            if let Some(slot) = state.slots.iter_mut().find(|s| &s.surface == surface)
-                && slot.scale_120 != scale
-            {
-                slot.scale_120 = scale;
-                changed = true;
-            }
-            if changed {
-                state.render_ready_slots(conn);
-            }
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event
+            && let Some(slot) = state.slots.iter_mut().find(|s| &s.surface == surface)
+        {
+            slot.scale_120 = scale;
+            slot.has_preferred_scale = true;
         }
     }
 }

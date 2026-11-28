@@ -10,16 +10,17 @@ use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bgpicker_core::splash::trace_startup;
 use calloop::channel::{self, Sender};
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, LoopSignal};
-use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use khronos_egl as egl;
 use log::{debug, warn};
 use smithay_client_toolkit::compositor::{
     CompositorHandler, CompositorState, FrameCallbackData, Region,
 };
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
+use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::wlr_layer::{
@@ -487,8 +488,13 @@ impl WaylandApp {
             return;
         }
         if let Some(splash) = self.startup_splash.take() {
+            trace_startup(
+                "egl_media_acknowledged",
+                format_args!("outputs={}", self.outputs.len()),
+            );
             splash.retire();
             let _ = self._conn.flush();
+            trace_startup("splash_retired", "");
         }
         for waiter in self.present_waiters.drain(..) {
             let _ = waiter.send(());
@@ -897,6 +903,9 @@ impl WaylandApp {
     }
 
     fn render_due(&mut self, qh: &QueueHandle<Self>) {
+        if let Some(splash) = &mut self.startup_splash {
+            splash.dispatch_pending();
+        }
         let now = Instant::now();
         let dt_s = now.saturating_duration_since(self.last_tick).as_secs_f32();
         self.last_tick = now;
@@ -905,6 +914,8 @@ impl WaylandApp {
         let kawase = self.active.kawase;
 
         for out in &mut self.outputs {
+            let awaiting_first_media =
+                self.startup_splash.is_some() && out.wallpaper.media_committed_serial == 0;
             render_slot(
                 &self.egl,
                 &self.programs,
@@ -916,6 +927,9 @@ impl WaylandApp {
                 kawase,
                 now,
             );
+            if awaiting_first_media && out.wallpaper.media_committed_serial > 0 {
+                trace_startup("egl_media_commit", format_args!("output={}", out.name));
+            }
             if let Some(ref mut b) = out.backdrop {
                 render_slot(
                     &self.egl,
@@ -1271,11 +1285,14 @@ impl WaylandRenderer {
         backdrop_enabled: bool,
         splash: Option<StartupSplashSpec>,
     ) -> Result<Self> {
-        let conn = Connection::connect_to_env()
-            .map_err(|e| GfxError::WaylandConnect(e.to_string()))?;
+        let trace = splash.is_some();
+        if trace {
+            trace_startup("wayland_connect", "");
+        }
+        let conn =
+            Connection::connect_to_env().map_err(|e| GfxError::WaylandConnect(e.to_string()))?;
 
-        // Show `wl_shm` splash BEFORE EGL/GPU initialization so cold-boot driver/shader
-        // warmup never delays Frame 1 or causes multi-process handoff races.
+        // Let the compositor present the SHM splash before warming up the EGL driver.
         let startup_splash = splash
             .as_ref()
             .and_then(|spec| ActiveSplash::show(&conn, spec));
@@ -1295,9 +1312,19 @@ impl WaylandRenderer {
             .ok();
 
         let wl_display_ptr = conn.backend().display_ptr() as *mut std::ffi::c_void;
+        if trace {
+            trace_startup("egl_start", "");
+        }
         let egl = unsafe { EglContext::new_wayland(wl_display_ptr)? };
         let is_nvidia_gpu = egl.is_nvidia;
+        if trace {
+            trace_startup("egl_ready", format_args!("nvidia={is_nvidia_gpu}"));
+            trace_startup("shaders_start", "");
+        }
         let programs = ShaderPrograms::compile(&egl.gl, egl.is_gles)?;
+        if trace {
+            trace_startup("shaders_ready", "");
+        }
 
         let event_loop = EventLoop::<WaylandApp>::try_new()
             .map_err(|e| GfxError::WaylandDispatch(e.to_string()))?;

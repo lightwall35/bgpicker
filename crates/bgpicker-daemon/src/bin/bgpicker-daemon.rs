@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use bgpicker_core::splash::trace_startup;
 use bgpicker_daemon::daemon::{resolve_project_dir, DaemonInstance, DaemonOptions};
 
 static SIGNAL_EXIT: AtomicBool = AtomicBool::new(false);
@@ -69,6 +70,8 @@ fn main() {
         }
     };
 
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
+    trace_startup("daemon_main", format_args!("boot_id={}", boot_id.trim()));
     let project_dir = resolve_project_dir(explicit_dir);
     let opts = DaemonOptions::from_env(socket, project_dir, restore);
 

@@ -53,6 +53,7 @@ dependencies = [
  "image",
  "khronos-egl",
  "log",
+ "rustix",
  "smithay-client-toolkit",
  "thiserror",
  "wayland-client",

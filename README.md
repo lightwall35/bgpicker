@@ -144,11 +144,13 @@ cargo build --release
 
 编译产物位于 `target/release/bgpicker-daemon`、`target/release/bgpickerctl`、`target/release/bgpicker-picker` 与 `target/release/bgpicker-splash`。通过 `./bgpicker.sh` 等包装脚本调用时，若未找到预编译二进制也会自动触发一次 release 构建；运行 `./bgpicker.sh start` 会仅拉起守护进程（选择器面板保持按需启动）。
 
-在 `~/.config/niri/config.kdl` 顶部加入守护进程自启动（`bgpicker-daemon` 会在 EGL/GL 上下文初始化之前，直接在同进程 `wl_shm` 连接上绘制预渲染 `BGPX` 位图或缓存垫图，待 `bgpicker:wallpaper` 真正上屏并收到 niri `wl_surface.frame` 确认后再同一线程内自动销毁临时垫图表面，零跨进程锁竞争与交接闪烁）：
+在 `~/.config/niri/config.kdl` 顶部加入守护进程自启动。`bgpicker-daemon` 先通过同一 Wayland 连接提交 `wl_shm` 垫图，收到 `wp_presentation` 呈现反馈后再初始化 EGL。呈现等待最多 250 ms，超时或协议不可用时继续启动。收到有效 EGL 壁纸帧的 `wl_surface.frame` 回调后撤掉垫图。
 
 ```kdl
 spawn-at-startup "/你的路径/bgpicker/target/release/bgpickerctl" "startup"
 ```
+
+`~/.cache/bgpicker/daemon.log` 中的 `bgpicker-startup` 记录可与 `journalctl -b -o short-monotonic` 对齐，分别查看垫图提交、实际呈现和 EGL 初始化的耗时。
 
 添加如下 `layer-rule` 将模糊层放入 niri 概览背景（**不要**将 `^bgpicker:wallpaper$` 放入 backdrop）：
 
