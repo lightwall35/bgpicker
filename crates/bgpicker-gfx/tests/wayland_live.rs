@@ -226,3 +226,80 @@ fn idle_animations_start_at_frame_zero_after_long_idle() {
     handle.send(RenderCommand::Shutdown).unwrap();
     renderer.step(Some(Duration::from_millis(20))).unwrap();
 }
+
+#[test]
+fn startup_splash_waits_for_real_presented_frame_before_retiring() {
+    use std::sync::mpsc;
+
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return;
+    }
+
+    let tmp_path = std::env::temp_dir().join(format!(
+        "bgpicker-gfx-splash-handoff-{}.png",
+        std::process::id()
+    ));
+    let mut img = image::RgbaImage::new(16, 16);
+    for px in img.pixels_mut() {
+        *px = image::Rgba([48, 120, 192, 255]);
+    }
+    if img.save(&tmp_path).is_err() {
+        return;
+    }
+
+    let spec = bgpicker_gfx::StartupSplashSpec {
+        fg_bin: None,
+        fg_image: Some(tmp_path.clone()),
+        bg_image: Some(tmp_path.clone()),
+    };
+    let mut renderer = match WaylandRenderer::connect_with_splash(true, Some(spec)) {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("skipping live splash handoff test: {err}");
+            let _ = std::fs::remove_file(&tmp_path);
+            return;
+        }
+    };
+    let handle = renderer.handle();
+
+    // Pump initial configure/frame cycles BEFORE applying any media.
+    let (early_tx, early_rx) = mpsc::sync_channel(1);
+    handle.send(RenderCommand::WaitPresented { reply: early_tx }).unwrap();
+    for _ in 0..8 {
+        renderer.step(Some(Duration::from_millis(15))).unwrap();
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        early_rx.try_recv().is_err(),
+        "WaitPresented (and splash retire) must NOT fire on empty configure frames before media"
+    );
+    assert!(handle.snapshots().iter().all(|o| !o.wallpaper.presented));
+
+    // Apply real media frame; WaitPresented must fire once compositor acknowledges Frame 1.
+    let frame = make_solid_frame("test://handoff-frame", [48, 120, 192, 255]);
+    handle
+        .send(RenderCommand::ApplyFrame {
+            frame,
+            transition: TransitionSpec::instant(),
+            targets: LayerTargets::Both,
+            modes: FrameModeTargets::default(),
+        })
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut handed_off = false;
+    while Instant::now() < deadline {
+        renderer.step(Some(Duration::from_millis(15))).unwrap();
+        if early_rx.try_recv().is_ok() {
+            handed_off = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(handed_off, "WaitPresented did not fire after applying real wallpaper frame");
+    assert!(handle.snapshots().iter().all(|o| o.wallpaper.presented));
+
+    handle.send(RenderCommand::Shutdown).unwrap();
+    renderer.step(Some(Duration::from_millis(20))).unwrap();
+    let _ = std::fs::remove_file(&tmp_path);
+}

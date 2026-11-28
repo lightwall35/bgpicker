@@ -234,8 +234,10 @@ struct LayerSurfaceSlot {
     pixel_height: u32,
     scale_120: u32,
     configured: bool,
+    opaque_region_size: Option<(u32, u32)>,
     waiting_frame_since: Option<Instant>,
     committed_serial: u64,
+    media_committed_serial: u64,
     pending_frame_serial: u64,
     acknowledged_serial: u64,
     pipeline: LayerPipeline,
@@ -296,12 +298,34 @@ impl LayerSurfaceSlot {
             pixel_height: 0,
             scale_120,
             configured: false,
+            opaque_region_size: None,
             waiting_frame_since: None,
             committed_serial: 0,
+            media_committed_serial: 0,
             pending_frame_serial: 0,
             acknowledged_serial: 0,
             pipeline: LayerPipeline::new(role, initial_parallax),
         }
+    }
+
+    fn sync_opaque_region(&mut self, compositor: &CompositorState) {
+        let desired = (self.pipeline.role == LayerRole::Wallpaper
+            && self.pipeline.is_presented()
+            && self.logical_width > 0
+            && self.logical_height > 0)
+            .then_some((self.logical_width, self.logical_height));
+        if desired == self.opaque_region_size {
+            return;
+        }
+        if let Some((w, h)) = desired {
+            if let Ok(region) = Region::new(compositor) {
+                region.add(0, 0, w as i32, h as i32);
+                self.layer.wl_surface().set_opaque_region(Some(region.wl_region()));
+            }
+        } else {
+            self.layer.wl_surface().set_opaque_region(None);
+        }
+        self.opaque_region_size = desired;
     }
 
     fn is_waiting_for_frame(&mut self, now: Instant) -> bool {
@@ -334,7 +358,9 @@ impl LayerSurfaceSlot {
                 wl_egl.resize(pw as i32, ph as i32, 0, 0);
                 self.pixel_width = pw;
                 self.pixel_height = ph;
-                self.pipeline.mark_dirty();
+                if self.pipeline.is_presented() || self.committed_serial > 0 {
+                    self.pipeline.mark_dirty();
+                }
             }
         } else {
             let wl_egl = WlEglSurface::new(
@@ -348,7 +374,9 @@ impl LayerSurfaceSlot {
             self.egl_surface = Some(egl_surf);
             self.pixel_width = pw;
             self.pixel_height = ph;
-            self.pipeline.mark_dirty();
+            if self.pipeline.is_presented() || self.committed_serial > 0 {
+                self.pipeline.mark_dirty();
+            }
         }
         Ok(())
     }
@@ -441,12 +469,15 @@ impl WaylandApp {
         !self.outputs.is_empty()
             && self.outputs.iter().all(|out| {
                 let wp_ok = out.wallpaper.configured
-                    && out.wallpaper.committed_serial > 0
-                    && out.wallpaper.acknowledged_serial >= out.wallpaper.committed_serial;
-                let bg_ok = out
-                    .backdrop
-                    .as_ref()
-                    .is_none_or(|b| !b.configured || b.committed_serial > 0);
+                    && out.wallpaper.pipeline.is_presented()
+                    && out.wallpaper.media_committed_serial > 0
+                    && out.wallpaper.acknowledged_serial >= out.wallpaper.media_committed_serial;
+                let bg_ok = out.backdrop.as_ref().is_none_or(|b| {
+                    !b.configured
+                        || !b.pipeline.is_presented()
+                        || (b.media_committed_serial > 0
+                            && b.acknowledged_serial >= b.media_committed_serial)
+                });
                 wp_ok && bg_ok
             })
     }
@@ -877,6 +908,7 @@ impl WaylandApp {
             render_slot(
                 &self.egl,
                 &self.programs,
+                &self.compositor_state,
                 qh,
                 &mut out.wallpaper,
                 dt_s,
@@ -885,7 +917,17 @@ impl WaylandApp {
                 now,
             );
             if let Some(ref mut b) = out.backdrop {
-                render_slot(&self.egl, &self.programs, qh, b, dt_s, zoom, kawase, now);
+                render_slot(
+                    &self.egl,
+                    &self.programs,
+                    &self.compositor_state,
+                    qh,
+                    b,
+                    dt_s,
+                    zoom,
+                    kawase,
+                    now,
+                );
             }
         }
         self.sync_snapshots();
@@ -908,6 +950,7 @@ impl WaylandApp {
 fn render_slot(
     egl: &EglContext,
     programs: &ShaderPrograms,
+    compositor: &CompositorState,
     qh: &QueueHandle<WaylandApp>,
     slot: &mut LayerSurfaceSlot,
     dt_s: f32,
@@ -916,7 +959,11 @@ fn render_slot(
     now: Instant,
 ) {
     let should_draw = slot.pipeline.tick(&egl.gl, dt_s);
-    if !should_draw || !slot.configured || slot.is_waiting_for_frame(now) {
+    if !should_draw
+        || !slot.configured
+        || (!slot.pipeline.is_presented() && slot.committed_serial == 0)
+        || slot.is_waiting_for_frame(now)
+    {
         return;
     }
     let Some(egl_surface) = slot.egl_surface else {
@@ -936,6 +983,8 @@ fn render_slot(
         return;
     }
 
+    slot.sync_opaque_region(compositor);
+
     let next_serial = slot.committed_serial + 1;
     if slot.pipeline.is_animating() || slot.pending_frame_serial < next_serial {
         let wl_surface = slot.layer.wl_surface();
@@ -951,6 +1000,11 @@ fn render_slot(
         warn!("bgpicker-gfx eglSwapBuffers error: {err}");
     } else {
         slot.committed_serial = next_serial;
+        slot.media_committed_serial = if slot.pipeline.is_presented() {
+            next_serial
+        } else {
+            0
+        };
     }
 }
 
