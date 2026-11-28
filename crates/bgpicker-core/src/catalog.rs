@@ -48,14 +48,12 @@ pub struct CatalogBundle {
     pub videos: Vec<CatalogEntry>,
 }
 
-/// Computes the exact SHA-256 cache key used by `video_wallpaper.prepare_thumbnail`.
-///
-/// Format: `sha256("bgpicker-video-thumb-v3-1280x672\0" + resolved_path + "\0" + size + "\0" + mtime_ns)`.
-pub fn video_thumbnail_cache_key(resolved_path: &Path) -> Result<String, CatalogError> {
+fn media_file_cache_key(prefix: &str, resolved_path: &Path) -> Result<String, CatalogError> {
     let meta = fs::metadata(resolved_path)?;
     let mtime_ns = (meta.mtime() as i128) * 1_000_000_000 + (meta.mtime_nsec() as i128);
     let mut hasher = Sha256::new();
-    hasher.update(b"bgpicker-video-thumb-v3-1280x672\0");
+    hasher.update(prefix.as_bytes());
+    hasher.update(b"\0");
     hasher.update(resolved_path.to_string_lossy().as_bytes());
     hasher.update(b"\0");
     hasher.update(meta.size().to_string().as_bytes());
@@ -64,20 +62,121 @@ pub fn video_thumbnail_cache_key(resolved_path: &Path) -> Result<String, Catalog
     Ok(hex_encode(&hasher.finalize()))
 }
 
+/// Computes the exact SHA-256 cache key used by `video_wallpaper.prepare_thumbnail`.
+///
+/// Format: `sha256("bgpicker-video-thumb-v3-1280x672\0" + resolved_path + "\0" + size + "\0" + mtime_ns)`.
+pub fn video_thumbnail_cache_key(resolved_path: &Path) -> Result<String, CatalogError> {
+    media_file_cache_key("bgpicker-video-thumb-v3-1280x672", resolved_path)
+}
+
 /// Computes the exact SHA-256 cache key used by `video_wallpaper.prepare_image_thumbnail`.
 ///
 /// Format: `sha256("bgpicker-image-thumb-v1-1280x672\0" + resolved_path + "\0" + size + "\0" + mtime_ns)`.
 pub fn image_thumbnail_cache_key(resolved_path: &Path) -> Result<String, CatalogError> {
-    let meta = fs::metadata(resolved_path)?;
-    let mtime_ns = (meta.mtime() as i128) * 1_000_000_000 + (meta.mtime_nsec() as i128);
-    let mut hasher = Sha256::new();
-    hasher.update(b"bgpicker-image-thumb-v1-1280x672\0");
-    hasher.update(resolved_path.to_string_lossy().as_bytes());
-    hasher.update(b"\0");
-    hasher.update(meta.size().to_string().as_bytes());
-    hasher.update(b"\0");
-    hasher.update(mtime_ns.to_string().as_bytes());
-    Ok(hex_encode(&hasher.finalize()))
+    media_file_cache_key("bgpicker-image-thumb-v1-1280x672", resolved_path)
+}
+
+fn startup_placeholder_target_box() -> (u32, u32) {
+    if let Ok(raw) = std::env::var("BGPICKER_PLACEHOLDER_SIZE") {
+        if let Some((w_s, h_s)) = raw.trim().split_once('x') {
+            if let (Ok(w), Ok(h)) = (w_s.parse::<u32>(), h_s.parse::<u32>()) {
+                if w >= 320 && h >= 240 {
+                    return (w.min(7680), h.min(4320));
+                }
+            }
+        }
+    }
+    (2560, 1600)
+}
+
+/// Computes the SHA-256 cache key for a high-resolution boot placeholder JPG (`swaybg` fast load).
+pub fn startup_placeholder_cache_key(
+    resolved_path: &Path,
+    is_video: bool,
+) -> Result<String, CatalogError> {
+    let (w, h) = startup_placeholder_target_box();
+    let kind = if is_video { "video" } else { "image" };
+    let prefix = format!("bgpicker-startup-placeholder-v1\0{kind}\0{w}x{h}");
+    media_file_cache_key(&prefix, resolved_path)
+}
+
+/// Returns an already-cached high-res startup placeholder JPG under `cache_dir/startup-placeholder`
+/// if present and non-empty (without spawning `magick` or `ffmpeg`).
+pub fn cached_startup_placeholder_path(
+    media: &Path,
+    cache_dir: &Path,
+    is_video: bool,
+) -> Option<PathBuf> {
+    let source = fs::canonicalize(media).ok()?;
+    let key = startup_placeholder_cache_key(&source, is_video).ok()?;
+    let target = cache_dir
+        .join("startup-placeholder")
+        .join(format!("{key}.jpg"));
+    is_nonempty_file(&target).then_some(target)
+}
+
+/// Generates (or reuses) a high-resolution, fast-decoding JPEG startup placeholder under
+/// `cache_dir/startup-placeholder` for either a static wallpaper or video wallpaper.
+pub fn prepare_startup_placeholder(
+    media: &Path,
+    cache_dir: &Path,
+    is_video: bool,
+) -> Result<PathBuf, CatalogError> {
+    let source = fs::canonicalize(media)?;
+    let (w, h) = startup_placeholder_target_box();
+    let key = startup_placeholder_cache_key(&source, is_video)?;
+    let dir = cache_dir.join("startup-placeholder");
+    fs::create_dir_all(&dir)?;
+    let target = dir.join(format!("{key}.jpg"));
+    if is_nonempty_file(&target) {
+        return Ok(target);
+    }
+    let tmp = dir.join(format!(
+        ".{key}.{}.{:?}.jpg",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+
+    let output = if is_video {
+        Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+            ])
+            .arg(&source)
+            .args([
+                "-frames:v",
+                "1",
+                "-vf",
+                &format!("scale={w}:{h}:force_original_aspect_ratio=decrease"),
+                "-q:v",
+                "2",
+            ])
+            .arg(&tmp)
+            .output()
+    } else {
+        let mut source_frame = source.as_os_str().to_os_string();
+        source_frame.push("[0]");
+        Command::new("magick")
+            .args(["-limit", "thread", "2"])
+            .arg(&source_frame)
+            .args([
+                "-auto-orient",
+                "-thumbnail",
+                &format!("{w}x{h}>"),
+                "-quality",
+                "93",
+                "-strip",
+            ])
+            .arg(&tmp)
+            .output()
+    };
+
+    finalize_thumbnail(output, &tmp, &target, "startup placeholder failed")
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -88,6 +187,15 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+/// Returns the cached video thumbnail path under `cache_dir/video-thumbnails`
+/// if it already exists on disk and is non-empty (without invoking `ffmpeg`).
+pub fn cached_video_thumbnail_path(video: &Path, cache_dir: &Path) -> Option<PathBuf> {
+    let source = fs::canonicalize(video).ok()?;
+    let key = video_thumbnail_cache_key(&source).ok()?;
+    let target = cache_dir.join("video-thumbnails").join(format!("{key}.jpg"));
+    is_nonempty_file(&target).then_some(target)
 }
 
 /// Returns the cached video thumbnail path under `cache_dir/video-thumbnails`,
@@ -324,6 +432,30 @@ pub fn build_video_catalog(
     scan_media_catalog_with(directory, VIDEO_EXTENSIONS, "video", |src| {
         prepare_video_thumbnail(src, cache_dir)
     })
+}
+
+/// Lists all supported videos in `dir` sorted case-insensitively by `(name.to_lowercase(), name)`.
+pub fn list_videos_sorted(dir: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<(String, PathBuf)> = Vec::new();
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        let lower = ext.to_ascii_lowercase();
+        if VIDEO_EXTENSIONS.contains(&lower.as_str()) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            entries.push((name, path));
+        }
+    }
+    entries.sort_by(|(a, _), (b, _)| (a.to_lowercase(), a).cmp(&(b.to_lowercase(), b)));
+    entries.into_iter().map(|(_, p)| p).collect()
 }
 
 /// Scans both static image and video directories into a [`CatalogBundle`].

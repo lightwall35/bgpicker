@@ -32,8 +32,8 @@ resolve_bgpickerctl() {
         return 0
     fi
     if command -v cargo >/dev/null 2>&1 && [[ -f "$dir/Cargo.toml" ]]; then
-        echo "BgPicker: building bgpickerctl and bgpicker-picker (release)..." >&2
-        cargo build --release -p bgpicker-daemon -p bgpicker-picker --manifest-path "$dir/Cargo.toml" >&2
+        echo "BgPicker: building bgpickerctl, bgpicker-picker, and bgpicker-splash (release)..." >&2
+        cargo build --release -p bgpicker-daemon -p bgpicker-picker -p bgpicker-splash --manifest-path "$dir/Cargo.toml" >&2
         if [[ -x "$dir/target/release/bgpickerctl" ]]; then
             printf '%s\n' "$dir/target/release/bgpickerctl"
             return 0
@@ -188,6 +188,26 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                 exit 1
             fi
             ;;
+        startup-placeholder|placeholder)
+            if [[ $# -eq 1 ]]; then
+                exec "$CTL" startup-placeholder
+            elif [[ $# -eq 2 && ( "$2" == on || "$2" == off || "$2" == toggle ) ]]; then
+                exec "$CTL" startup-placeholder "$2"
+            else
+                echo "Usage: $0 startup-placeholder [on|off|toggle]" >&2
+                exit 1
+            fi
+            ;;
+        placeholder-cache)
+            if [[ $# -eq 1 ]]; then
+                exec "$CTL" placeholder-cache
+            elif [[ $# -eq 2 && ( "$2" == on || "$2" == off || "$2" == toggle ) ]]; then
+                exec "$CTL" placeholder-cache "$2"
+            else
+                echo "Usage: $0 placeholder-cache [on|off|toggle]" >&2
+                exit 1
+            fi
+            ;;
         transition)
             if [[ $# -eq 1 ]]; then
                 exec "$CTL" transition
@@ -203,7 +223,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
             exec "$CTL" clear-cache "$@"
             ;;
         *)
-            echo "Usage: $0 {start|stop|toggle|open|close|next|prev|mode [awww|parallax|toggle]|backdrop-parallax [on|off|toggle]|transition [type]|engine [status|simple|full|video|toggle|startup]|video [status|normal|parallax [file]|next]|clear-cache [--deep] [--picker] [--disk] [--all]}" >&2
+            echo "Usage: $0 {start|stop|toggle|open|close|next|prev|mode [awww|parallax|toggle]|backdrop-parallax [on|off|toggle]|startup-placeholder [on|off|toggle]|placeholder-cache [on|off|toggle]|transition [type]|engine [status|simple|full|video|toggle|startup]|video [status|normal|parallax [file]|next]|clear-cache [--deep] [--picker] [--disk] [--all]}" >&2
             exit 1
             ;;
     esac

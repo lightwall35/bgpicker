@@ -84,6 +84,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bgpicker-splash"
+version = "0.1.0"
+dependencies = [
+ "bgpicker-core",
+ "image",
+ "libc",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
+]
+
+[[package]]
 name = "bgpicker-video"
 version = "0.1.0"
 dependencies = [

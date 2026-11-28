@@ -349,6 +349,25 @@ fn cli_parser_covers_full_contract() {
         }
     );
 
+    assert_eq!(
+        parse_args(["startup-placeholder"]).unwrap().1,
+        CtlCommand::StartupPlaceholder { action: None }
+    );
+    assert_eq!(
+        parse_args(["placeholder", "off"]).unwrap().1,
+        CtlCommand::StartupPlaceholder {
+            action: Some(BackdropAction::Off)
+        }
+    );
+    assert_eq!(
+        parse_args(["placeholder-cache", "toggle"]).unwrap().1,
+        CtlCommand::PlaceholderCache {
+            action: Some(BackdropAction::Toggle)
+        }
+    );
+    assert!(parse_args(["startup-placeholder", "bad"]).is_err());
+    assert!(parse_args(["placeholder-cache", "on", "extra"]).is_err());
+
     let (_, c) = parse_args([
         "apply-static",
         "--keep-backdrop",
@@ -2149,4 +2168,1063 @@ fn cross_mode_media_switch_applies_modes_atomically_without_pre_snap() {
     );
 
     daemon.shutdown();
+}
+
+#[test]
+fn startup_seed_and_settle_smoothly_transition_static_parallax_and_video() {
+    let tmp = TempDir::new("startup-seed-settle");
+    let root = tmp.path();
+    let paths = isolated_paths(root);
+    let proj = root.join("proj");
+    fs::create_dir_all(proj.join("wallpapers")).unwrap();
+    fs::create_dir_all(proj.join("dynamic")).unwrap();
+
+    let img_wp = proj.join("wallpapers/bg.png");
+    let placeholder_thumb = root.join("video_thumb.png");
+    let vid_a = proj.join("dynamic/demo.mp4");
+    write_tiny_png(&img_wp);
+    write_tiny_png(&placeholder_thumb);
+    fs::write(&vid_a, b"dummy video").unwrap();
+
+    atomic_write_text(&paths.settings_file(), r#"{"transition":{"type":"fade","durationMs":600}}"#)
+        .unwrap();
+    atomic_write_text(&paths.engine_file(), "full").unwrap();
+    atomic_write_text(&paths.mode_file(), "parallax").unwrap();
+    atomic_write_text(&paths.backdrop_parallax_file(), "on").unwrap();
+    atomic_write_text(&paths.current_wallpaper_file(), img_wp.to_str().unwrap()).unwrap();
+
+    // 1. Full/Parallax startup handoff: seed centered (mode_blend=0), settle into smooth parallax glide.
+    let renderer = Arc::new(MockRenderer::new());
+    let video = Arc::new(MockVideo::new());
+    let daemon = DaemonInstance::start_with_backends(
+        DaemonOptions {
+            paths: paths.clone(),
+            project_dir: proj.clone(),
+            restore_on_start: false,
+            enable_niri: false,
+            enable_settings_watch: false,
+        },
+        renderer.clone(),
+        video.clone(),
+    )
+    .expect("start full daemon");
+    let client = IpcClient::new(daemon.socket_path());
+    let _ = renderer.take_ops();
+
+    let seed_resp = client
+        .call(&Request::StartupSeed { placeholder: None })
+        .unwrap();
+    assert!(seed_resp.ok);
+    assert_eq!(seed_resp.data, Some(ResponseData::Message("seeded".into())));
+    let ops = renderer.take_ops();
+    assert!(
+        ops.iter().any(|op| matches!(
+            op,
+            RecordedRenderOp::ApplyFrame {
+                effect: TransitionEffect::None,
+                duration_ms: 0,
+                targets: LayerTargets::Both,
+                modes: FrameModeTargets {
+                    wallpaper_parallax: Some(false),
+                    backdrop_parallax: Some(false),
+                },
+                ..
+            }
+        )),
+        "StartupSeed must draw centered placeholder matching swaybg, got {ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| matches!(op, RecordedRenderOp::SetMode { parallax: true, .. })),
+        "StartupSeed must not snap into parallax before settle: {ops:?}"
+    );
+
+    assert!(client.call(&Request::StartupSettle).unwrap().ok);
+    let settle_ops = renderer.take_ops();
+    assert!(
+        settle_ops.iter().any(|op| matches!(
+            op,
+            RecordedRenderOp::SetMode {
+                parallax: true,
+                duration_ms: Some(dur),
+                targets: LayerTargets::Both,
+            } if *dur > 0
+        )),
+        "StartupSettle must smoothly enter parallax after placeholder retires, got {settle_ops:?}"
+    );
+    drop(daemon);
+
+    // 2. Video/Parallax startup handoff: seed placeholder, then non-instant fade transition to live video.
+    atomic_write_text(&paths.engine_file(), "video").unwrap();
+    atomic_write_text(&paths.video_mode_file(), "parallax").unwrap();
+    atomic_write_text(&paths.video_wallpaper_file(), vid_a.to_str().unwrap()).unwrap();
+
+    let renderer = Arc::new(MockRenderer::new());
+    let video = Arc::new(MockVideo::new());
+    let daemon = DaemonInstance::start_with_backends(
+        DaemonOptions {
+            paths: paths.clone(),
+            project_dir: proj.clone(),
+            restore_on_start: false,
+            enable_niri: false,
+            enable_settings_watch: false,
+        },
+        renderer.clone(),
+        video.clone(),
+    )
+    .expect("start video daemon");
+    let client = IpcClient::new(daemon.socket_path());
+    let _ = renderer.take_ops();
+
+    let seed_resp = client
+        .call(&Request::StartupSeed {
+            placeholder: Some(placeholder_thumb.clone()),
+        })
+        .unwrap();
+    assert!(seed_resp.ok);
+    assert_eq!(seed_resp.data, Some(ResponseData::Message("seeded".into())));
+    let seed_ops = renderer.take_ops();
+    assert!(
+        seed_ops.iter().any(|op| matches!(
+            op,
+            RecordedRenderOp::ApplyFrame {
+                effect: TransitionEffect::None,
+                targets: LayerTargets::Both,
+                modes: FrameModeTargets {
+                    wallpaper_parallax: Some(false),
+                    backdrop_parallax: Some(false),
+                },
+                ..
+            }
+        )),
+        "Video StartupSeed must draw centered placeholder, got {seed_ops:?}"
+    );
+
+    assert!(client.call(&Request::StartupSettle).unwrap().ok);
+    let vid_ops = renderer.take_ops();
+    assert!(
+        vid_ops.iter().any(|op| matches!(
+            op,
+            RecordedRenderOp::ApplyFrame {
+                effect: TransitionEffect::Fade,
+                duration_ms: 600,
+                targets: LayerTargets::Both,
+                modes: FrameModeTargets {
+                    wallpaper_parallax: Some(true),
+                    backdrop_parallax: Some(true),
+                },
+                ..
+            }
+        )),
+        "Video StartupSettle must run smooth transition from placeholder into parallax video, got {vid_ops:?}"
+    );
+}
+
+#[test]
+fn ctl_startup_spawns_and_retires_placeholder_processes_with_zero_leftovers() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("ctl-startup-placeholder");
+    let root = tmp.path();
+    let paths = isolated_paths(root);
+    let proj = root.join("proj");
+    fs::create_dir_all(proj.join("wallpapers")).unwrap();
+    fs::create_dir_all(proj.join("dynamic")).unwrap();
+
+    let img_wp = proj.join("wallpapers/wp.png");
+    let blur_wp = root.join("cache/bgpicker/blur/cached.png");
+    fs::create_dir_all(blur_wp.parent().unwrap()).unwrap();
+    write_tiny_png(&img_wp);
+    write_tiny_png(&blur_wp);
+
+    atomic_write_text(&paths.engine_file(), "full").unwrap();
+    atomic_write_text(&paths.mode_file(), "parallax").unwrap();
+    atomic_write_text(&paths.current_wallpaper_file(), img_wp.to_str().unwrap()).unwrap();
+    atomic_write_text(&paths.legacy_swaybg_cache_file(), blur_wp.to_str().unwrap()).unwrap();
+
+    let swaybg_log = root.join("swaybg_spawn.log");
+    let fake_swaybg = root.join("fake_swaybg.sh");
+    fs::write(
+        &fake_swaybg,
+        format!(
+            "#!/bin/sh\nprintf 'pid=%s args=%s\\n' \"$$\" \"$*\" >> \"{}\"\nwhile true; do sleep 1; done\n",
+            swaybg_log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_swaybg, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let ipc_trace = root.join("daemon_ipc.log");
+    let fake_daemon = root.join("fake_daemon.py");
+    fs::write(
+        &fake_daemon,
+        r#"#!/usr/bin/env python3
+import json, os, signal, socket, sys
+
+sock_path = None
+args = sys.argv[1:]
+i = 0
+while i < len(args):
+    if args[i] == "--socket":
+        sock_path = args[i + 1]
+        i += 2
+    elif args[i] == "--project-dir":
+        i += 2
+    else:
+        i += 1
+
+try:
+    os.unlink(sock_path)
+except FileNotFoundError:
+    pass
+
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sock_path)
+srv.listen(8)
+
+stop = False
+def handle_sig(*_):
+    global stop
+    stop = True
+signal.signal(signal.SIGTERM, handle_sig)
+signal.signal(signal.SIGINT, handle_sig)
+
+front_pid_file = os.environ["TEST_FRONT_PID_FILE"]
+back_pid_file = os.environ["TEST_BACK_PID_FILE"]
+trace_path = os.environ["TEST_IPC_TRACE"]
+
+while not stop:
+    try:
+        conn, _ = srv.accept()
+    except OSError:
+        break
+    with conn:
+        line = conn.makefile("r").readline()
+        if not line:
+            continue
+        req = json.loads(line)
+        cmd = req.get("cmd")
+        with open(trace_path, "a") as tf:
+            tf.write(f"{cmd}|front={os.path.exists(front_pid_file)}|back={os.path.exists(back_pid_file)}\n")
+        if cmd == "ping":
+            resp = {"ok": True, "data": {"kind": "pong"}}
+        elif cmd == "startup_seed":
+            resp = {"ok": True, "data": {"kind": "message", "value": "seeded"}}
+        elif cmd in ("startup_settle", "startup"):
+            resp = {"ok": True}
+        elif cmd == "stop":
+            resp = {"ok": True}
+            stop = True
+        else:
+            resp = {"ok": True}
+        conn.sendall((json.dumps(resp) + "\n").encode())
+
+srv.close()
+try:
+    os.unlink(sock_path)
+except FileNotFoundError:
+    pass
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&fake_daemon, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let ctl_bin = env!("CARGO_BIN_EXE_bgpickerctl");
+    let sock = paths.daemon_socket_path();
+    let run_ctl = |args: &[&str]| {
+        Command::new(ctl_bin)
+            .args([
+                "--socket",
+                sock.to_str().unwrap(),
+                "--project-dir",
+                proj.to_str().unwrap(),
+            ])
+            .args(args)
+            .env("HOME", root.join("home"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_RUNTIME_DIR", root.join("runtime"))
+            .env("BGPICKER_DAEMON", &fake_daemon)
+            .env("BGPICKER_SWAYBG", &fake_swaybg)
+            .env("BGPICKER_PLACEHOLDER_SETTLE_MS", "20")
+            .env("TEST_FRONT_PID_FILE", paths.startup_placeholder_front_pid_file())
+            .env("TEST_BACK_PID_FILE", paths.startup_placeholder_back_pid_file())
+            .env("TEST_IPC_TRACE", &ipc_trace)
+            .env_remove("NIRI_SOCKET")
+            .output()
+            .expect("run bgpickerctl")
+    };
+
+    // Cold startup must spawn placeholders, seed daemon, retire placeholders BEFORE StartupSettle, and leave 0 alive.
+    let out = run_ctl(&["startup"]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+
+    assert!(
+        !paths.startup_placeholder_front_pid_file().exists(),
+        "front placeholder pid file leaked"
+    );
+    assert!(
+        !paths.startup_placeholder_back_pid_file().exists(),
+        "back placeholder pid file leaked"
+    );
+
+    let swaybg_text = fs::read_to_string(&swaybg_log).expect("expected swaybg spawns");
+    let spawned_pids: Vec<i32> = swaybg_text
+        .lines()
+        .filter_map(|line| {
+            line.split_whitespace()
+                .next()?
+                .strip_prefix("pid=")?
+                .parse::<i32>()
+                .ok()
+        })
+        .collect();
+    assert_eq!(spawned_pids.len(), 2, "expected front + back placeholder spawns: {swaybg_text}");
+    assert!(
+        swaybg_text.contains(img_wp.to_str().unwrap())
+            && swaybg_text.contains(blur_wp.to_str().unwrap()),
+        "expected both wallpaper and cached blur placeholders: {swaybg_text}"
+    );
+    for pid in spawned_pids {
+        let alive = unsafe { libc::kill(pid, 0) == 0 };
+        assert!(!alive, "placeholder pid {pid} leaked after ctl startup!");
+    }
+
+    let trace = fs::read_to_string(&ipc_trace).unwrap();
+    assert!(
+        trace.contains("startup_seed|front=True|back=True"),
+        "expected placeholders alive during startup_seed: {trace}"
+    );
+    assert!(
+        trace.contains("startup_settle|front=False|back=False"),
+        "expected placeholders retired BEFORE startup_settle: {trace}"
+    );
+
+    // Calling `startup` while daemon is already live must NOT spawn extra placeholders.
+    let _ = fs::remove_file(&swaybg_log);
+    let second = run_ctl(&["startup"]);
+    assert!(second.status.success());
+    assert!(
+        !swaybg_log.exists(),
+        "startup with already-live daemon must not flash extra placeholders"
+    );
+
+    let stop_out = run_ctl(&["stop"]);
+    assert!(stop_out.status.success());
+}
+
+#[test]
+fn ctl_startup_placeholder_options_and_highres_cache_lifecycle() {
+    use bgpicker_core::{prepare_startup_placeholder, startup_placeholder_cache_key};
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("ctl-ph-options");
+    let root = tmp.path();
+    let paths = isolated_paths(root);
+    let proj = root.join("proj");
+    fs::create_dir_all(proj.join("wallpapers")).unwrap();
+    fs::create_dir_all(proj.join("dynamic")).unwrap();
+
+    let img_wp = proj.join("wallpapers/wp.png");
+    let vid_wp = proj.join("dynamic/vid.mp4");
+    write_tiny_png(&img_wp);
+    let status = Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=320x200:r=10:d=0.3",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&vid_wp)
+        .status()
+        .expect("run ffmpeg");
+    assert!(status.success(), "ffmpeg failed to synthesize test video");
+
+    atomic_write_text(&paths.engine_file(), "full").unwrap();
+    atomic_write_text(&paths.current_wallpaper_file(), img_wp.to_str().unwrap()).unwrap();
+    atomic_write_text(&paths.video_wallpaper_file(), vid_wp.to_str().unwrap()).unwrap();
+
+    // Generate high-res placeholder caches for BOTH static and video.
+    let img_ph = prepare_startup_placeholder(&img_wp, &paths.cache_dir, false).unwrap();
+    let vid_ph = prepare_startup_placeholder(&vid_wp, &paths.cache_dir, true).unwrap();
+    assert!(img_ph.is_file());
+    assert!(vid_ph.is_file());
+    let expected_vid_key =
+        startup_placeholder_cache_key(&fs::canonicalize(&vid_wp).unwrap(), true).unwrap();
+    assert!(vid_ph.to_string_lossy().contains(&expected_vid_key));
+
+    let swaybg_log = root.join("swaybg_spawn.log");
+    let fake_swaybg = root.join("fake_swaybg.sh");
+    fs::write(
+        &fake_swaybg,
+        format!(
+            "#!/bin/sh\nprintf 'pid=%s args=%s\\n' \"$$\" \"$*\" >> \"{}\"\nwhile true; do sleep 1; done\n",
+            swaybg_log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_swaybg, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let fake_daemon = root.join("fake_daemon.py");
+    fs::write(
+        &fake_daemon,
+        r#"#!/usr/bin/env python3
+import json, os, signal, socket, sys
+
+sock_path = None
+args = sys.argv[1:]
+i = 0
+while i < len(args):
+    if args[i] == "--socket":
+        sock_path = args[i + 1]
+        i += 2
+    elif args[i] == "--project-dir":
+        i += 2
+    else:
+        i += 1
+
+try:
+    os.unlink(sock_path)
+except FileNotFoundError:
+    pass
+
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sock_path)
+srv.listen(8)
+
+stop = False
+def handle_sig(*_):
+    global stop
+    stop = True
+signal.signal(signal.SIGTERM, handle_sig)
+signal.signal(signal.SIGINT, handle_sig)
+
+while not stop:
+    try:
+        conn, _ = srv.accept()
+    except OSError:
+        break
+    with conn:
+        line = conn.makefile("r").readline()
+        if not line:
+            continue
+        req = json.loads(line)
+        cmd = req.get("cmd")
+        if cmd == "ping":
+            resp = {"ok": True, "data": {"kind": "pong"}}
+        elif cmd == "startup_seed":
+            resp = {"ok": True, "data": {"kind": "message", "value": "seeded"}}
+        elif cmd == "stop":
+            resp = {"ok": True}
+            stop = True
+        else:
+            resp = {"ok": True}
+        conn.sendall((json.dumps(resp) + "\n").encode())
+
+srv.close()
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&fake_daemon, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let ctl_bin = env!("CARGO_BIN_EXE_bgpickerctl");
+    let sock = paths.daemon_socket_path();
+    let run_ctl = |args: &[&str]| {
+        Command::new(ctl_bin)
+            .args([
+                "--socket",
+                sock.to_str().unwrap(),
+                "--project-dir",
+                proj.to_str().unwrap(),
+            ])
+            .args(args)
+            .env("HOME", root.join("home"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_RUNTIME_DIR", root.join("runtime"))
+            .env("BGPICKER_DAEMON", &fake_daemon)
+            .env("BGPICKER_SWAYBG", &fake_swaybg)
+            .env("BGPICKER_PLACEHOLDER_SETTLE_MS", "20")
+            .env_remove("NIRI_SOCKET")
+            .output()
+            .expect("run bgpickerctl")
+    };
+
+    // 1. Default options report "on".
+    assert_eq!(
+        String::from_utf8_lossy(&run_ctl(&["startup-placeholder"]).stdout).trim(),
+        "on"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_ctl(&["placeholder-cache"]).stdout).trim(),
+        "on"
+    );
+
+    // 2. Full startup with placeholder-cache=on uses high-res cached JPG instead of raw PNG.
+    assert!(run_ctl(&["startup"]).status.success());
+    let log_full = fs::read_to_string(&swaybg_log).unwrap();
+    assert!(
+        log_full.contains(img_ph.to_str().unwrap()),
+        "expected cached high-res static placeholder in {log_full}"
+    );
+    assert!(run_ctl(&["stop"]).status.success());
+
+    // 3. Video startup with placeholder-cache=on uses high-res cached video JPG.
+    atomic_write_text(&paths.engine_file(), "video").unwrap();
+    let _ = fs::remove_file(&swaybg_log);
+    assert!(run_ctl(&["startup"]).status.success());
+    let log_vid = fs::read_to_string(&swaybg_log).unwrap();
+    assert!(
+        log_vid.contains(vid_ph.to_str().unwrap()),
+        "expected cached high-res video placeholder in {log_vid}"
+    );
+    assert!(run_ctl(&["stop"]).status.success());
+
+    // 4. `placeholder-cache off` disables high-res cache usage and falls back cleanly.
+    assert!(run_ctl(&["placeholder-cache", "off"]).status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run_ctl(&["placeholder-cache"]).stdout).trim(),
+        "off"
+    );
+    atomic_write_text(&paths.engine_file(), "full").unwrap();
+    let _ = fs::remove_file(&swaybg_log);
+    assert!(run_ctl(&["startup"]).status.success());
+    let log_nocache = fs::read_to_string(&swaybg_log).unwrap();
+    assert!(
+        !log_nocache.contains(img_ph.to_str().unwrap())
+            && log_nocache.contains(img_wp.to_str().unwrap()),
+        "expected raw fallback when placeholder-cache=off: {log_nocache}"
+    );
+    assert!(run_ctl(&["stop"]).status.success());
+
+    // 5. `startup-placeholder off` skips spawning swaybg altogether on startup.
+    assert!(run_ctl(&["startup-placeholder", "off"]).status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run_ctl(&["startup-placeholder"]).stdout).trim(),
+        "off"
+    );
+    let _ = fs::remove_file(&swaybg_log);
+    assert!(run_ctl(&["startup"]).status.success());
+    assert!(
+        !swaybg_log.exists(),
+        "expected zero swaybg spawns when startup-placeholder=off"
+    );
+    assert!(run_ctl(&["stop"]).status.success());
+
+    // 6. Toggle back on, clean disk cache, and verify `placeholder-cache on` warms fresh caches.
+    assert!(run_ctl(&["clear-cache", "--disk"]).status.success());
+    assert!(!img_ph.exists() && !vid_ph.exists());
+    assert!(run_ctl(&["placeholder-cache", "on"]).status.success());
+    assert!(run_ctl(&["startup-placeholder", "toggle"]).status.success());
+    assert!(img_ph.is_file() && vid_ph.is_file());
+    assert_eq!(
+        String::from_utf8_lossy(&run_ctl(&["startup-placeholder"]).stdout).trim(),
+        "on"
+    );
+}
+
+#[test]
+fn actor_writes_and_updates_startup_splash_fg_bin_and_disk_clear_removes_it() {
+    use bgpicker_core::read_splash_header;
+
+    let tmp = TempDir::new("actor-splash-bin");
+    let root = tmp.path();
+    let paths = isolated_paths(root);
+    let proj = root.join("proj");
+    fs::create_dir_all(proj.join("wallpapers")).unwrap();
+    fs::create_dir_all(proj.join("dynamic")).unwrap();
+
+    let wp = proj.join("wallpapers/wp.png");
+    write_tiny_png(&wp);
+    let wp_canon = fs::canonicalize(&wp).unwrap();
+
+    let renderer = Arc::new(MockRenderer::new());
+    let video = Arc::new(MockVideo::new());
+    let daemon = DaemonInstance::start_with_backends(
+        DaemonOptions {
+            paths: paths.clone(),
+            project_dir: proj.clone(),
+            restore_on_start: false,
+            enable_niri: false,
+            enable_settings_watch: false,
+        },
+        renderer,
+        video,
+    )
+    .expect("start daemon");
+    let client = IpcClient::new(daemon.socket_path());
+
+    let apply_resp = client
+        .call(&Request::ApplyStatic {
+            path: wp_canon,
+            mode: Some(WallpaperMode::Parallax),
+            instant: true,
+            backdrop: BackdropOverride::Auto,
+        })
+        .unwrap();
+    assert!(apply_resp.ok, "{apply_resp:?}");
+
+    let splash_bin = paths.startup_splash_fg_bin_file();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !splash_bin.is_file() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        splash_bin.is_file(),
+        "expected ApplyStatic with placeholder_cache=on to create {}",
+        splash_bin.display()
+    );
+    let mut f = fs::File::open(&splash_bin).unwrap();
+    let (w, h) = read_splash_header(&mut f).expect("valid BGPX splash header");
+    assert!(w > 0 && h > 0, "expected non-zero BGPX dimensions, got {w}x{h}");
+    drop(f);
+
+    // Disabling + deleting bin + re-enabling rebuilds startup-splash-fg.bin cleanly.
+    assert!(client
+        .call(&Request::PlaceholderCache {
+            action: BackdropAction::Off,
+        })
+        .unwrap()
+        .ok);
+    fs::remove_file(&splash_bin).unwrap();
+    assert!(client
+        .call(&Request::PlaceholderCache {
+            action: BackdropAction::On,
+        })
+        .unwrap()
+        .ok);
+    let deadline2 = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline2 && !splash_bin.is_file() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        splash_bin.is_file(),
+        "expected PlaceholderCache(On) to rebuild {}",
+        splash_bin.display()
+    );
+
+    drop(daemon);
+
+    // `bgpickerctl clear-cache --disk` removes `startup-splash-fg.bin`.
+    let ctl_bin = env!("CARGO_BIN_EXE_bgpickerctl");
+    let sock = root.join("runtime/bgpicker.sock");
+    let out = Command::new(ctl_bin)
+        .args([
+            "--socket",
+            sock.to_str().unwrap(),
+            "--project-dir",
+            proj.to_str().unwrap(),
+            "clear-cache",
+            "--disk",
+        ])
+        .env("HOME", root.join("home"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .output()
+        .expect("run clear-cache --disk");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !splash_bin.exists(),
+        "expected clear-cache --disk to remove {}",
+        splash_bin.display()
+    );
+}
+
+#[test]
+fn ctl_startup_uses_bgpicker_splash_ready_handshake_fg_bin_and_zero_leftovers() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("ctl-splash-handshake");
+    let root = tmp.path();
+    let paths = isolated_paths(root);
+    let proj = root.join("proj");
+    fs::create_dir_all(proj.join("wallpapers")).unwrap();
+    fs::create_dir_all(proj.join("dynamic")).unwrap();
+
+    let img_wp = proj.join("wallpapers/wp.png");
+    let blur_wp = root.join("cache/bgpicker/blur/cached.png");
+    fs::create_dir_all(blur_wp.parent().unwrap()).unwrap();
+    write_tiny_png(&img_wp);
+    write_tiny_png(&blur_wp);
+
+    atomic_write_text(&paths.engine_file(), "full").unwrap();
+    atomic_write_text(&paths.mode_file(), "parallax").unwrap();
+    atomic_write_text(&paths.current_wallpaper_file(), img_wp.to_str().unwrap()).unwrap();
+    atomic_write_text(&paths.legacy_swaybg_cache_file(), blur_wp.to_str().unwrap()).unwrap();
+
+    // Seed pre-rendered BGPX bitmap so `startup` passes `--fg-bin`.
+    let splash_bin = paths.startup_splash_fg_bin_file();
+    let src_rgba = [12_u8, 34, 56, 255];
+    bgpicker_core::write_splash_bin_from_packed(&splash_bin, 1, 1, 4, &src_rgba, false, 16, 16)
+        .unwrap();
+
+    let events_log = root.join("events.log");
+    let fake_splash = root.join("fake_splash.py");
+    fs::write(
+        &fake_splash,
+        r#"#!/usr/bin/env python3
+import os, signal, sys, time
+
+log_path = os.environ["TEST_EVENTS_LOG"]
+def log(msg):
+    with open(log_path, "a") as f:
+        f.write(msg + "\n")
+
+args = sys.argv[1:]
+ready_fd = None
+i = 0
+while i < len(args):
+    if args[i] == "--ready-fd" and i + 1 < len(args):
+        ready_fd = int(args[i + 1])
+        i += 2
+    else:
+        i += 1
+
+def on_term(_sig, _frame):
+    log("SPLASH_SIGTERM")
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, on_term)
+log("SPLASH_START " + " ".join(args))
+time.sleep(0.05)
+if ready_fd is not None:
+    os.write(ready_fd, b"\x01")
+    os.close(ready_fd)
+log("SPLASH_READY")
+while True:
+    time.sleep(0.05)
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&fake_splash, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let fake_daemon = root.join("fake_daemon.py");
+    fs::write(
+        &fake_daemon,
+        r#"#!/usr/bin/env python3
+import json, os, socket, sys
+
+log_path = os.environ["TEST_EVENTS_LOG"]
+def log(msg):
+    with open(log_path, "a") as f:
+        f.write(msg + "\n")
+
+args = sys.argv[1:]
+sock_path = args[args.index("--socket") + 1]
+os.makedirs(os.path.dirname(sock_path), exist_ok=True)
+if os.path.exists(sock_path):
+    os.unlink(sock_path)
+
+log("DAEMON_SPAWNED")
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sock_path)
+srv.listen(8)
+
+running = True
+while running:
+    conn, _ = srv.accept()
+    with conn:
+        f = conn.makefile("rwb")
+        while True:
+            line = f.readline()
+            if not line:
+                break
+            req = json.loads(line.decode())
+            cmd = req.get("cmd")
+            if cmd == "ping":
+                resp = {"ok": True, "data": {"kind": "pong"}}
+            elif cmd == "startup_seed":
+                log("DAEMON_STARTUP_SEED")
+                resp = {"ok": True, "data": {"kind": "message", "value": "seeded"}}
+            elif cmd == "startup_settle":
+                log("DAEMON_STARTUP_SETTLE")
+                resp = {"ok": True}
+            elif cmd == "stop":
+                resp = {"ok": True}
+                running = False
+            else:
+                resp = {"ok": True}
+            f.write((json.dumps(resp) + "\n").encode())
+            f.flush()
+            if not running:
+                break
+srv.close()
+if os.path.exists(sock_path):
+    os.unlink(sock_path)
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&fake_daemon, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let ctl_bin = env!("CARGO_BIN_EXE_bgpickerctl");
+    let sock = paths.daemon_socket_path();
+    let run_ctl = |args: &[&str]| {
+        Command::new(ctl_bin)
+            .args(["--socket", sock.to_str().unwrap(), "--project-dir", proj.to_str().unwrap()])
+            .args(args)
+            .env("HOME", root.join("home"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_RUNTIME_DIR", root.join("runtime"))
+            .env("BGPICKER_DAEMON", &fake_daemon)
+            .env("BGPICKER_SPLASH", &fake_splash)
+            .env("BGPICKER_PLACEHOLDER_SETTLE_MS", "20")
+            .env("TEST_EVENTS_LOG", &events_log)
+            .env_remove("NIRI_SOCKET")
+            .output()
+            .expect("run bgpickerctl")
+    };
+
+    let out = run_ctl(&["startup"]);
+    assert!(
+        out.status.success(),
+        "startup failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let events = fs::read_to_string(&events_log).unwrap();
+    let lines: Vec<&str> = events.lines().collect();
+    let pos_ready = lines.iter().position(|l| *l == "SPLASH_READY");
+    let pos_daemon = lines.iter().position(|l| *l == "DAEMON_SPAWNED");
+    let pos_term = lines.iter().position(|l| *l == "SPLASH_SIGTERM");
+    assert!(
+        pos_ready.is_some() && pos_daemon.is_some() && pos_ready < pos_daemon,
+        "expected SPLASH_READY before DAEMON_SPAWNED, events:\n{events}"
+    );
+    assert!(pos_term.is_some(), "expected SPLASH_SIGTERM cleanup, events:\n{events}");
+    assert!(
+        events.contains("--fg-bin ") && events.contains(splash_bin.to_str().unwrap()),
+        "expected --fg-bin <splash_bin> in startup args, events:\n{events}"
+    );
+    assert!(
+        events.contains("--fg-image ") && events.contains("--bg-image "),
+        "expected --fg-image and --bg-image in startup args, events:\n{events}"
+    );
+    assert!(
+        !paths.startup_placeholder_front_pid_file().exists(),
+        "expected splash pid file cleaned up after retire"
+    );
+
+    assert!(run_ctl(&["stop"]).status.success());
+
+    // When `placeholder-cache off`, `--fg-bin` must NOT be passed to bgpicker-splash.
+    assert!(run_ctl(&["placeholder-cache", "off"]).status.success());
+    let _ = fs::remove_file(&events_log);
+    let out2 = run_ctl(&["startup"]);
+    assert!(out2.status.success());
+    let events2 = fs::read_to_string(&events_log).unwrap();
+    assert!(!events2.contains("--fg-bin "), "expected --fg-bin omitted when placeholder-cache=off, events:\n{events2}");
+    assert!(events2.contains("--fg-image ") && events2.contains("SPLASH_SIGTERM"));
+    assert!(run_ctl(&["stop"]).status.success());
+}
+
+#[test]
+fn ctl_startup_preserves_independent_splash_daemon_until_daemon_presents_first_frame() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("independent-splash-daemon");
+    let root = tmp.path();
+    let paths = isolated_paths(root);
+    let proj = root.join("proj");
+    fs::create_dir_all(proj.join("wallpapers")).unwrap();
+    fs::create_dir_all(proj.join("dynamic")).unwrap();
+
+    let img_wp = proj.join("wallpapers/wp.png");
+    write_tiny_png(&img_wp);
+    atomic_write_text(&paths.engine_file(), "full").unwrap();
+    atomic_write_text(&paths.mode_file(), "parallax").unwrap();
+    atomic_write_text(&paths.current_wallpaper_file(), img_wp.to_str().unwrap()).unwrap();
+
+    let events_log = root.join("events.log");
+    let ext_splash = root.join("bgpicker-splash");
+    fs::write(
+        &ext_splash,
+        r#"#!/usr/bin/env python3
+import fcntl, os, signal, sys, time
+
+log_path = os.environ["TEST_EVENTS_LOG"]
+lock_path = os.environ["TEST_LOCK_FILE"]
+pid_path = os.environ["TEST_PID_FILE"]
+os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+lock_f = open(lock_path, "a+")
+fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+pid = os.getpid()
+with open(f"/proc/{pid}/stat") as sf:
+    s = sf.read()
+    start = s[s.rfind(")") + 2:].split()[19]
+with open(pid_path, "w") as pf:
+    pf.write(f"{pid} {start}\n")
+
+with open(log_path, "a") as lf:
+    lf.write("EXT_SPLASH_STARTED\n")
+
+def on_term(_sig, _frame):
+    with open(log_path, "a") as lf:
+        lf.write("EXT_SPLASH_SIGTERM\n")
+    try:
+        os.unlink(pid_path)
+    except FileNotFoundError:
+        pass
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, on_term)
+while True:
+    time.sleep(0.05)
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&ext_splash, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let dup_trap = root.join("dup_trap_splash.sh");
+    fs::write(
+        &dup_trap,
+        format!(
+            "#!/bin/sh\necho DUPLICATE_SPLASH_SPAWNED >> \"{}\"\nexit 1\n",
+            events_log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&dup_trap, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let fake_daemon = root.join("fake_daemon.py");
+    fs::write(
+        &fake_daemon,
+        r#"#!/usr/bin/env python3
+import json, os, signal, socket, sys
+
+log_path = os.environ["TEST_EVENTS_LOG"]
+pid_path = os.environ["TEST_PID_FILE"]
+def log(msg):
+    with open(log_path, "a") as f:
+        f.write(msg + "\n")
+
+args = sys.argv[1:]
+sock_path = args[args.index("--socket") + 1]
+os.makedirs(os.path.dirname(sock_path), exist_ok=True)
+if os.path.exists(sock_path):
+    os.unlink(sock_path)
+
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sock_path)
+srv.listen(8)
+
+running = True
+while running:
+    conn, _ = srv.accept()
+    with conn:
+        f = conn.makefile("rwb")
+        while True:
+            line = f.readline()
+            if not line:
+                break
+            req = json.loads(line.decode())
+            cmd = req.get("cmd")
+            if cmd == "ping":
+                resp = {"ok": True, "data": {"kind": "pong"}}
+            elif cmd == "startup_seed":
+                alive = False
+                if os.path.exists(pid_path):
+                    spid = int(open(pid_path).read().split()[0])
+                    try:
+                        os.kill(spid, 0)
+                        alive = True
+                        log("EXT_SPLASH_ALIVE_DURING_SEED")
+                        # Simulate real daemon retiring splash AFTER Frame 1 presents:
+                        os.kill(spid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                log("DAEMON_STARTUP_SEED")
+                resp = {"ok": True, "data": {"kind": "message", "value": "seeded" if alive else "unseeded"}}
+            elif cmd == "startup_settle":
+                log("DAEMON_STARTUP_SETTLE")
+                resp = {"ok": True}
+            elif cmd == "stop":
+                resp = {"ok": True}
+                running = False
+            else:
+                resp = {"ok": True}
+            f.write((json.dumps(resp) + "\n").encode())
+            f.flush()
+            if not running:
+                break
+srv.close()
+if os.path.exists(sock_path):
+    os.unlink(sock_path)
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&fake_daemon, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Start independent external splash process (just like `niri/config.kdl` does).
+    let mut ext_child = Command::new(&ext_splash)
+        .env("TEST_EVENTS_LOG", &events_log)
+        .env("TEST_LOCK_FILE", paths.startup_placeholder_lock_file())
+        .env("TEST_PID_FILE", paths.startup_placeholder_front_pid_file())
+        .spawn()
+        .expect("spawn external splash daemon");
+
+    let wait_deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < wait_deadline
+        && !paths.startup_placeholder_front_pid_file().is_file()
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(paths.startup_placeholder_front_pid_file().is_file());
+
+    let ctl_bin = env!("CARGO_BIN_EXE_bgpickerctl");
+    let sock = paths.daemon_socket_path();
+    let run_ctl = |args: &[&str]| {
+        Command::new(ctl_bin)
+            .args(["--socket", sock.to_str().unwrap(), "--project-dir", proj.to_str().unwrap()])
+            .args(args)
+            .env("HOME", root.join("home"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_RUNTIME_DIR", root.join("runtime"))
+            .env("BGPICKER_DAEMON", &fake_daemon)
+            .env("BGPICKER_SPLASH", &dup_trap)
+            .env("TEST_EVENTS_LOG", &events_log)
+            .env("TEST_PID_FILE", paths.startup_placeholder_front_pid_file())
+            .env_remove("NIRI_SOCKET")
+            .output()
+            .expect("run bgpickerctl")
+    };
+
+    let out = run_ctl(&["startup"]);
+    assert!(
+        out.status.success(),
+        "startup failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = ext_child.wait();
+
+    let events = fs::read_to_string(&events_log).unwrap();
+    assert!(
+        !events.contains("DUPLICATE_SPLASH_SPAWNED"),
+        "expected bgpickerctl startup NOT to spawn a second placeholder while lock is held:\n{events}"
+    );
+    assert!(
+        events.contains("EXT_SPLASH_ALIVE_DURING_SEED"),
+        "expected independent splash daemon to stay alive until daemon startup_seed:\n{events}"
+    );
+    assert!(
+        events.contains("EXT_SPLASH_SIGTERM"),
+        "expected independent splash daemon to be terminated cleanly after daemon presented:\n{events}"
+    );
+    assert!(run_ctl(&["stop"]).status.success());
 }

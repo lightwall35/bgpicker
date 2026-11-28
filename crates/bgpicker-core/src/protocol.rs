@@ -110,6 +110,11 @@ pub enum Request {
     Ping,
     Status,
     Startup,
+    StartupSeed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placeholder: Option<PathBuf>,
+    },
+    StartupSettle,
     Restore,
     Stop,
     ReloadSettings,
@@ -128,6 +133,12 @@ pub enum Request {
         backdrop: BackdropOverride,
     },
     BackdropParallax {
+        action: BackdropAction,
+    },
+    StartupPlaceholder {
+        action: BackdropAction,
+    },
+    PlaceholderCache {
         action: BackdropAction,
     },
     ApplyVideo {
@@ -182,6 +193,10 @@ pub struct OutputStatus {
     pub transition_active: bool,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Complete daemon status snapshot matching the IPC contract.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -192,6 +207,10 @@ pub struct DaemonStatus {
     pub video_mode: VideoMode,
     pub current_video: Option<PathBuf>,
     pub backdrop_parallax: bool,
+    #[serde(default = "default_true")]
+    pub startup_placeholder: bool,
+    #[serde(default = "default_true")]
+    pub placeholder_cache: bool,
     pub transition: TransitionSettings,
     pub parallax: ParallaxSettings,
     pub busy: bool,

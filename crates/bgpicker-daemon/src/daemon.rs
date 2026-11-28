@@ -195,30 +195,5 @@ impl Drop for DaemonInstance {
 /// Resolves the bgpicker repository/project directory from CLI override, `BGPICKER_DIR`,
 /// current directory, or ancestors of the running executable.
 pub fn resolve_project_dir(explicit: Option<PathBuf>) -> PathBuf {
-    if let Some(dir) = explicit {
-        return dir;
-    }
-    if let Some(env_dir) = std::env::var_os("BGPICKER_DIR").filter(|s| !s.is_empty()) {
-        return PathBuf::from(env_dir);
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        if looks_like_project_dir(&cwd) {
-            return cwd;
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        let mut cur = exe.parent();
-        while let Some(dir) = cur {
-            if looks_like_project_dir(dir) {
-                return dir.to_path_buf();
-            }
-            cur = dir.parent();
-        }
-    }
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-}
-
-fn looks_like_project_dir(dir: &Path) -> bool {
-    dir.join("shell.qml").is_file()
-        || (dir.join("wallpapers").is_dir() && dir.join("dynamic").is_dir())
+    bgpicker_core::resolve_project_dir(explicit)
 }

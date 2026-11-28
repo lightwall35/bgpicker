@@ -1,6 +1,6 @@
 # BgPicker：壁纸选择、实时 GPU 模糊背景与视差引擎
 
-适用于 **niri**（Wayland）的壁纸工具。`rust` 分支将静态壁纸、动态视频壁纸、视差排版、换图过渡着色器、概览实时模糊，以及按需拉起的纯 Rust 双页倾斜卡片选择器（`bgpicker-picker`）全面整合进同一套 Rust 工作区，面板关闭即退出释放（**0 MiB** 常驻内存/显存）；同时仍保留 `Quickshell` 旧版前端作为可选回退（`BGPICKER_USE_QS=1`），简洁模式则使用两个受管理的 `swaybg` 实例极简运行。
+适用于 **niri**（Wayland）的壁纸工具。`rust` 分支将静态壁纸、动态视频壁纸、视差排版、换图过渡着色器、概览实时模糊、极速开机垫图独立守护进程（`bgpicker-splash`），以及按需拉起的纯 Rust 双页倾斜卡片选择器（`bgpicker-picker`）全面整合进同一套 Rust 工作区，面板关闭即退出释放（**0 MiB** 常驻内存/显存）；同时仍保留 `Quickshell` 旧版前端作为可选回退（`BGPICKER_USE_QS=1`），简洁模式则使用两个受管理的 `swaybg` 实例极简运行。
 
 | 引擎 / 模式 | 清晰前景（`bgpicker:wallpaper`） | 概览模糊后景（`bgpicker:backdrop`） | 渲染后端 |
 | --- | --- | --- | --- |
@@ -25,6 +25,8 @@
 ./bgpicker.sh engine full              # 恢复完整静态壁纸模式
 ./bgpicker.sh engine simple            # 切换到双 swaybg 简洁模式
 ./bgpicker.sh status                   # 查看守护进程与输出状态
+./bgpicker.sh startup-placeholder [on|off|toggle]  # 开机垫图开关（默认 on）
+./bgpicker.sh placeholder-cache [on|off|toggle]    # 高清垫图与 BGPX 位图缓存开关（默认 on）
 ./bgpicker.sh clear-cache [--deep] [--picker] [--disk] [--all]  # 手动清理空闲缓存与内存
 ./bgpicker_stats.sh [-w [秒数]]        # 一键抓取 bgpicker-daemon 与按需面板的 CPU/PSS/VRAM 占用
 ```
@@ -38,6 +40,8 @@ bgpickerctl apply-static <图片路径> [--mode awww|parallax] [--keep-backdrop 
 bgpickerctl apply-video [normal|parallax|toggle] [视频路径] [--keep-backdrop | --backdrop <on|off|keep>]
 bgpickerctl mode [awww|parallax|toggle] [--keep-backdrop | --backdrop <on|off|keep>]
 bgpickerctl backdrop-parallax [on|off|toggle]
+bgpickerctl startup-placeholder [on|off|toggle]
+bgpickerctl placeholder-cache [on|off|toggle]
 bgpickerctl transition [fade|wipe|wave|grow|outer|random|none]
 bgpickerctl engine [status|full|simple|video|toggle]
 bgpickerctl reload-settings
@@ -70,28 +74,81 @@ bgpickerctl clear-cache [--deep] [--picker] [--disk] [--all]
 
 此外，`bgpicker-daemon` 在应用静态壁纸时也会在后台异步更新兼容模糊图（`~/.cache/bgpicker/blur/` 及 `~/.cache/current_swaybg_img`），以便 `simple` 模式切换或锁屏程序（如 `swaylock`）直接复用。
 
-## 构建、依赖与启动
+## 从零部署指南（新机器完整安装与彻底清除）
 
-### 依赖清单
+### 1. 系统依赖清单
 
-- **构建 `bgpicker-daemon` / `bgpickerctl` / `bgpicker-picker`**：Rust 工具链（`cargo`）、`pkg-config`、C 编译器（`cc`）、FFmpeg 与 DRM 开发库（`libavformat`、`libavcodec`、`libswscale`、`libavutil`、`libdrm`）、`libxkbcommon`。
-- **完整／视频运行期**：Wayland 合成器（niri 会话提供 `NIRI_SOCKET`）、EGL / OpenGL ES 运行时、`ImageMagick`（`magick`，静态缩略图与兼容模糊图）、`ffmpeg` CLI（视频缩略图）、`Bash`；原生面板不再依赖常驻 `Quickshell`（如需回退旧版 QML 面板，可设置 `BGPICKER_USE_QS=1` 并安装 `Quickshell`）。
-- **简洁模式补充依赖**：`swaybg`、`Python 3`、`util-linux`（`flock`）。
+- **构建 `bgpicker-daemon` / `bgpickerctl` / `bgpicker-picker` / `bgpicker-splash`**：Rust 工具链（`cargo`、`rustc`）、`pkg-config`、C 编译器（`cc`/`gcc`）、FFmpeg 与 DRM/Wayland 开发库（`libavformat`、`libavcodec`、`libswscale`、`libavutil`、`libdrm`、`wayland-client`、`wayland-egl`、`libxkbcommon`）。
+- **完整／视频运行期**：Wayland 合成器（`niri` 会话提供 `NIRI_SOCKET`）、EGL / OpenGL ES 运行时、`ImageMagick`（`magick`，静态缩略图与兼容模糊图）、`ffmpeg` CLI（视频缩略图与开机视频封面提取）、`Bash`、`Python 3`；原生面板不再依赖常驻 `Quickshell`（如需回退旧版 QML 面板，可设置 `BGPICKER_USE_QS=1` 并安装 `Quickshell`）。
+- **简洁模式补充依赖**：`swaybg`、`util-linux`（`flock`）。
 
-### 编译
+各发行版可直接按需安装依赖：
+
+```bash
+# Arch Linux
+sudo pacman -S --needed git rust pkgconf gcc ffmpeg libdrm wayland libxkbcommon imagemagick swaybg python util-linux
+
+# Debian / Ubuntu
+sudo apt update && sudo apt install -y git cargo rustc pkg-config gcc \
+  libavformat-dev libavcodec-dev libswscale-dev libavutil-dev \
+  libdrm-dev libwayland-dev libxkbcommon-dev libegl-dev \
+  imagemagick ffmpeg swaybg python3 util-linux
+
+# Fedora
+sudo dnf install -y git cargo rust pkgconf-pkg-config gcc \
+  ffmpeg-free-devel libdrm-devel wayland-devel libxkbcommon-devel mesa-libEGL-devel \
+  ImageMagick ffmpeg swaybg python3 util-linux
+```
+
+### 2. 一键从零部署（推荐）
+
+在新机器上拉取代码、放入媒体文件后直接执行 `./deploy.sh` 即可完成全流程：
+
+```bash
+git clone -b rust https://github.com/lightwall35/bgpicker.git ~/playground/bgpicker
+cd ~/playground/bgpicker
+
+# 可选：提前检查本机依赖是否齐全（不修改任何文件）
+./deploy.sh --check-only
+
+# 将个人壁纸图片放入 wallpapers/，动态视频放入 dynamic/，然后一键编译并部署：
+./deploy.sh
+```
+
+`deploy.sh` 会依次完成以下工作（全部操作幂等，可随时重复运行）：
+1. 检查编译与运行期依赖，缺少构建库时输出当前发行版对应的安装命令。
+2. 创建 `wallpapers/`、`dynamic/` 及 `${XDG_CONFIG_HOME:-~/.config}/bgpicker/`，并在不存在 `settings.json` 时从 `settings.example.json` 复制默认配置。
+3. 执行 `cargo build --release`，编译 `bgpicker-daemon`、`bgpickerctl`、`bgpicker-picker` 与 `bgpicker-splash`。
+4. 将上述 4 个可执行文件软链接到 `~/.local/bin`（可用 `--no-bin-link` 或 `--bin-dir` 自定义）。
+5. 自动备份 `~/.config/niri/config.kdl` 后写入受管理的开机自启动、`layer-rule` 概览模糊规则与默认快捷键（若无冲突），并自动调用 `niri validate` 校验语法（校验失败自动回滚）。
+6. 若当前处于活跃 Wayland 会话，自动开启 `startup-placeholder` 与 `placeholder-cache` 并拉起 `bgpicker-daemon`。
+
+常用参数：
+
+```bash
+./deploy.sh --dry-run             # 仅预览将要执行的步骤，不改写任何文件
+./deploy.sh --skip-build          # 跳过 cargo build --release
+./deploy.sh --skip-niri-config    # 仅编译与软链，不改动 niri 配置
+./deploy.sh --no-binds            # 不自动添加 Mod+N 等默认快捷键
+./deploy.sh --no-start            # 部署后不立即拉起守护进程
+./deploy.sh --niri-config /path/to/config.kdl
+```
+
+### 3. 手动编译、niri 自启动与开机垫图说明
+
+如希望手工部署，可先执行构建：
 
 ```bash
 cargo build --release
 ```
 
-编译产物位于 `target/release/bgpicker-daemon`、`target/release/bgpickerctl` 与 `target/release/bgpicker-picker`。通过 `./bgpicker.sh` 等包装脚本调用时，若未找到预编译二进制也会自动触发一次 release 构建；运行 `./bgpicker.sh start` 会仅拉起守护进程（选择器面板保持按需启动）。
+编译产物位于 `target/release/bgpicker-daemon`、`target/release/bgpickerctl`、`target/release/bgpicker-picker` 与 `target/release/bgpicker-splash`。通过 `./bgpicker.sh` 等包装脚本调用时，若未找到预编译二进制也会自动触发一次 release 构建；运行 `./bgpicker.sh start` 会仅拉起守护进程（选择器面板保持按需启动）。
 
-### niri 自启动与 Layer 规则
-
-在 `~/.config/niri/config.kdl` 中使用统一入口（移除旧版的 `awww-daemon` 和直接启动 `qs` 的条目）：
+在 `~/.config/niri/config.kdl` 顶部加入独立开机垫图与守护进程自启动（`bgpicker-splash` 仅依赖 `libwayland-client` / `libc`，直接映射预渲染 `BGPX` 位图绘制首帧，等 `bgpicker-daemon` 收到 niri 的 `wl_surface.frame` 真正上屏确认后再自动退出，避免交接闪烁且无残留）：
 
 ```kdl
-spawn-at-startup "/home/lightwall/playground/bgpicker/wallpaper_engine.sh" "startup"
+spawn-at-startup "/你的路径/bgpicker/target/release/bgpicker-splash" "--daemon"
+spawn-at-startup "/你的路径/bgpicker/target/release/bgpickerctl" "startup"
 ```
 
 添加如下 `layer-rule` 将模糊层放入 niri 概览背景（**不要**将 `^bgpicker:wallpaper$` 放入 backdrop）：
@@ -102,6 +159,35 @@ layer-rule {
     match namespace="^wallpaper$" // 简洁模式的模糊 swaybg
     place-within-backdrop true
 }
+```
+
+### 4. 部署后快速验证
+
+```bash
+bgpickerctl status       # 检查 niri_connected: true、outputs 与当前引擎状态
+./bgpicker.sh toggle     # 呼出纯 Rust 选择器面板（或按 Mod+N）
+```
+
+### 5. 彻底清除与卸载（`./uninstall.sh`）
+
+需要彻底移除本工具或其运行时数据时，直接运行：
+
+```bash
+./uninstall.sh           # 交互确认后彻底清理；加 --dry-run 可先预览清理清单
+./uninstall.sh -y        # 无交互直接执行清理
+```
+
+`uninstall.sh` 默认会：
+1. 优雅停止所有运行中的 `bgpicker-daemon`、`bgpicker-picker`、`bgpicker-splash`、相关 `swaybg` 与可选 `Quickshell` / `awww` 进程。
+2. 自动备份 `~/.config/niri/config.kdl` 并清除其中所有 BgPicker 相关的 `spawn-at-startup`、`layer-rule` 与快捷键条目，然后执行 `niri validate` 校验（失败自动恢复）。
+3. 删除 `~/.local/bin` 中指向本仓库的二进制软链接。
+4. 彻底删除 `${XDG_CONFIG_HOME:-~/.config}/bgpicker/`、`${XDG_STATE_HOME:-~/.local/state}/bgpicker/`、`${XDG_CACHE_HOME:-~/.cache}/bgpicker/`（含缩略图、模糊缓存、`startup-placeholder/`、`startup-splash-fg.bin` 与日志）、遗留的 `~/.cache/current_swaybg_img` 及运行期 IPC 套接字，并清理 `target/`、`native/build/` 等编译产物（可用 `--keep-target` 保留 `target/`）。
+
+为防误删个人壁纸，默认保留 `wallpapers/`、`dynamic/` 与仓库源码目录；若确定连同个人媒体或整个目录一并抹除，可显式追加：
+
+```bash
+./uninstall.sh -y --purge-media   # 同时清空 wallpapers/ 与 dynamic/ 中的个人媒体
+./uninstall.sh -y --purge-repo    # 连同整个仓库目录一并删除（谨慎使用）
 ```
 
 ## 使用
@@ -220,10 +306,14 @@ cp -n settings.example.json "${XDG_CONFIG_HOME:-$HOME/.config}/bgpicker/settings
 | `${XDG_STATE_HOME:-~/.local/state}/bgpicker/mode` | 完整模式静态偏好：`awww`／`parallax` |
 | `${XDG_STATE_HOME:-~/.local/state}/bgpicker/backdrop_parallax` | 模糊背景视差开关：`on`／`off` |
 | `${XDG_STATE_HOME:-~/.local/state}/bgpicker/video-wallpaper`、`video-mode` | 上次视频路径及 `normal`／`parallax` 模式 |
+| `${XDG_STATE_HOME:-~/.local/state}/bgpicker/startup_placeholder`、`placeholder_cache` | 开机垫图与高分辨率缓存开关（默认 `on`） |
+| `${XDG_STATE_HOME:-~/.local/state}/bgpicker/startup-placeholder-{front,back}.pid`、`startup-placeholder.lock` | 独立开机垫图进程 PID 与防重排他锁 |
 | `${XDG_STATE_HOME:-~/.local/state}/bgpicker/simple-{front,back}.pid` | 简洁模式两个 `swaybg` 实例的 PID 与启动时间 |
 | `${XDG_CACHE_HOME:-~/.cache}/bgpicker/daemon.log` | `bgpicker-daemon` 运行日志 |
 | `${XDG_CACHE_HOME:-~/.cache}/bgpicker/image-thumbnails/` | 静态壁纸 `1280×672` JPG 缩略图缓存 |
 | `${XDG_CACHE_HOME:-~/.cache}/bgpicker/video-thumbnails/` | 动态视频 `1280×672` JPG 缩略图缓存 |
+| `${XDG_CACHE_HOME:-~/.cache}/bgpicker/startup-placeholder/` | 高分辨率开机垫图 JPG 缓存（静态与视频封面） |
+| `${XDG_CACHE_HOME:-~/.cache}/bgpicker/startup-splash-fg.bin` | 预渲染零解码 `BGPX` XRGB8888 前景启动位图缓存 |
 | `${XDG_CACHE_HOME:-~/.cache}/bgpicker/blur/` | 兼容 `simple` 模式与锁屏的离线静态模糊图缓存 |
 | `~/.cache/current_swaybg_img` | 指向当前静态兼容模糊图的兼容路径 |
 | `${XDG_CACHE_HOME:-~/.cache}/bgpicker/swaybg-front` | 简洁模式前景 `swaybg` 本地 namespace 副本 |
@@ -238,19 +328,20 @@ cp -n settings.example.json "${XDG_CONFIG_HOME:-$HOME/.config}/bgpicker/settings
 
 ## 目录结构与开发验证
 
-- **`crates/bgpicker-core`**：XDG 路径与原子状态读写、配置规范化与随机效果解析、视差/几何数学、`niri` IPC 客户端、守护进程与选择器 JSON IPC 协议、媒体目录扫描与缩略图缓存。
-- **`crates/bgpicker-gfx`**：`smithay-client-toolkit` + `wayland-egl` + `glow` 双层渲染器（`bgpicker:wallpaper` / `bgpicker:backdrop`）、换图着色器（`fade`/`wipe`/`wave`/`grow`/`outer`，含跨模式旧画面 `old_mode_blend` 冻结）、图像空间缓存 3-pass `DualKawaseBlur`。
+- **`crates/bgpicker-core`**：XDG 路径与原子状态读写、配置规范化与随机效果解析、视差/几何数学、`niri` IPC 客户端、守护进程与选择器 JSON IPC 协议、媒体目录扫描与缩略图/垫图/`BGPX` 位图缓存工具。
+- **`crates/bgpicker-gfx`**：`smithay-client-toolkit` + `wayland-egl` + `glow` 双层渲染器（`bgpicker:wallpaper` / `bgpicker:backdrop`）、换图着色器（`fade`/`wipe`/`wave`/`grow`/`outer`，含跨模式旧画面 `old_mode_blend` 冻结）、图像空间缓存 3-pass `DualKawaseBlur` 与 `WaitPresented` 上屏同步。
 - **`crates/bgpicker-video`**：基于 FFmpeg C FFI（`ffi/ffmpeg_shim.c`）的异步视频解码线程与三缓冲帧池，支持硬件加速探测、帧步调控制、双帧预热与首 4 帧背景预热。
+- **`crates/bgpicker-splash`**：纯 Rust 轻量级开机独立垫图程序（`wl_shm` + `memfd` + `wp_viewporter` + `wp_fractional_scale_v1`，零 EGL/Cairo/gdk-pixbuf/X11 依赖），支持 `--daemon` 单实例自启、`BGPX` 零解码直传与 `--ready-fd` 握手。
 - **`crates/bgpicker-daemon`**：单线程序列化 Actor 状态机、`bgpicker-daemon` 守护进程与 `bgpickerctl` CLI、`inotify` 配置监听与按需选择器拉起。
 - **`crates/bgpicker-picker`**：纯 Rust 原生 Wayland 覆盖层面板（`bgpicker:overlay`）：`state.rs` 状态机与弹簧/三次缓动动画、`render.rs` 单通道 SDF 圆角倾斜卡片与控件着色器、`text.rs` 惰性零拷贝 `swash` + `mmap` HiDPI 中英文字形图集、`thumbs.rs` 有界异步 LRU 缩略图与 1.5s 原图放大缓存、`wayland.rs`/`ipc.rs` 单实例事件循环与守护进程桥接。
-- **兼容前端与包装脚本**：`shell.qml`、`BgPicker.qml`、`Carousel.qml`、`CarouselMedia.js`、`SkewSelector.qml`、`WallpaperTransitions.js` 保留作为 `BGPICKER_USE_QS=1` 回退前端；`bgpicker.sh`、`bgpicker_stats.sh`、`wallpaper_engine.sh`、`switch_wallpaper.sh`、`picker_action.sh`、`backdrop_parallax.sh`、`backdrop_awww.sh`、`simple_wallpaper.sh` 代理到 `bgpickerctl` 或管理简洁模式。
+- **部署与兼容脚本**：`deploy.sh` 与 `uninstall.sh` 负责新机器从零部署与彻底清除；`shell.qml`、`BgPicker.qml`、`Carousel.qml`、`CarouselMedia.js`、`SkewSelector.qml`、`WallpaperTransitions.js` 保留作为 `BGPICKER_USE_QS=1` 回退前端；`bgpicker.sh`、`bgpicker_stats.sh`、`wallpaper_engine.sh`、`switch_wallpaper.sh`、`picker_action.sh`、`backdrop_parallax.sh`、`backdrop_awww.sh`、`simple_wallpaper.sh` 代理到 `bgpickerctl` 或管理简洁模式。
 
 本地验证命令：
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-bash -n bgpicker.sh bgpicker_stats.sh picker_action.sh wallpaper_engine.sh simple_wallpaper.sh prepare_wallpaper.sh switch_wallpaper.sh backdrop_awww.sh backdrop_parallax.sh
+bash -n deploy.sh uninstall.sh bgpicker.sh bgpicker_stats.sh picker_action.sh wallpaper_engine.sh simple_wallpaper.sh prepare_wallpaper.sh switch_wallpaper.sh backdrop_awww.sh backdrop_parallax.sh
 python3 -m unittest discover -s tests -v
 QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -input tests/qml
 ```

@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use bgpicker_core::{ParallaxSettings as CoreParallaxSettings, ResolvedTransition};
 use bgpicker_gfx::{
@@ -73,6 +74,7 @@ pub trait RendererBackend: Send + Sync {
     ) -> Result<(), String>;
     fn trim_idle(&self) -> Result<(), String>;
     fn clear(&self) -> Result<(), String>;
+    fn wait_presented(&self, _timeout: Duration) {}
     fn shutdown(&self);
     fn snapshots(&self) -> Vec<OutputSnapshot>;
 }
@@ -202,6 +204,10 @@ impl RendererBackend for GfxRendererBackend {
         self.handle
             .send(RenderCommand::Clear)
             .map_err(|e| e.to_string())
+    }
+
+    fn wait_presented(&self, timeout: Duration) {
+        self.handle.wait_presented(timeout);
     }
 
     fn shutdown(&self) {

@@ -730,6 +730,8 @@ fn protocol_ipc_roundtrip_over_unix_socket() {
                     video_mode: VideoMode::Normal,
                     current_video: None,
                     backdrop_parallax: true,
+                    startup_placeholder: true,
+                    placeholder_cache: true,
                     transition: Default::default(),
                     parallax: Default::default(),
                     busy: false,
@@ -827,4 +829,121 @@ fn protocol_picker_command_wire_format_and_socket_roundtrip() {
     let received = server.join().unwrap();
     let expected: Vec<PickerCommand> = cases.iter().map(|(c, _)| *c).collect();
     assert_eq!(received, expected);
+}
+
+#[test]
+fn startup_placeholder_paths_and_protocol_requests_roundtrip() {
+    let tmp = TempDir::new("startup-placeholder");
+    let paths = BgPickerPaths::with_roots(
+        tmp.path().join("home"),
+        tmp.path().join("cfg"),
+        tmp.path().join("cache"),
+        tmp.path().join("state"),
+        tmp.path().join("run"),
+    );
+    assert_eq!(
+        paths.startup_placeholder_front_pid_file(),
+        tmp.path().join("state/bgpicker/startup-placeholder-front.pid")
+    );
+    assert_eq!(
+        paths.startup_placeholder_back_pid_file(),
+        tmp.path().join("state/bgpicker/startup-placeholder-back.pid")
+    );
+
+    let video = tmp.path().join("demo.mp4");
+    fs::write(&video, b"fake-video").unwrap();
+    assert_eq!(
+        bgpicker_core::cached_video_thumbnail_path(&video, &paths.cache_dir),
+        None
+    );
+    let key = bgpicker_core::video_thumbnail_cache_key(&fs::canonicalize(&video).unwrap()).unwrap();
+    let thumb_dir = paths.video_thumbnails_dir();
+    fs::create_dir_all(&thumb_dir).unwrap();
+    let thumb = thumb_dir.join(format!("{key}.jpg"));
+    fs::write(&thumb, b"jpg-bytes").unwrap();
+    assert_eq!(
+        bgpicker_core::cached_video_thumbnail_path(&video, &paths.cache_dir).as_deref(),
+        Some(thumb.as_path())
+    );
+
+    let seed = Request::StartupSeed {
+        placeholder: Some(thumb.clone()),
+    };
+    let encoded_seed = serde_json::to_string(&seed).unwrap();
+    let decoded_seed: Request = serde_json::from_str(&encoded_seed).unwrap();
+    assert_eq!(decoded_seed, seed);
+
+    let settle = Request::StartupSettle;
+    let encoded_settle = serde_json::to_string(&settle).unwrap();
+    assert_eq!(encoded_settle, r#"{"cmd":"startup_settle"}"#);
+    assert_eq!(
+        serde_json::from_str::<Request>(&encoded_settle).unwrap(),
+        Request::StartupSettle
+    );
+
+    assert_eq!(
+        paths.startup_placeholder_file(),
+        tmp.path().join("state/bgpicker/startup_placeholder")
+    );
+    assert_eq!(
+        paths.placeholder_cache_file(),
+        tmp.path().join("state/bgpicker/placeholder_cache")
+    );
+    assert_eq!(
+        paths.startup_placeholder_cache_dir(),
+        tmp.path().join("cache/bgpicker/startup-placeholder")
+    );
+
+    // Startup placeholder / placeholder cache default to true when absent, and respect "off"/"on".
+    let defaults = PersistedState::load(&paths);
+    assert!(defaults.startup_placeholder);
+    assert!(defaults.placeholder_cache);
+    atomic_write_text(&paths.startup_placeholder_file(), "off").unwrap();
+    atomic_write_text(&paths.placeholder_cache_file(), "off").unwrap();
+    let disabled = PersistedState::load(&paths);
+    assert!(!disabled.startup_placeholder);
+    assert!(!disabled.placeholder_cache);
+
+    // High-res cached startup placeholder lookup for images & videos.
+    let img = tmp.path().join("wall.png");
+    fs::write(&img, b"fake-img").unwrap();
+    assert_eq!(
+        bgpicker_core::cached_startup_placeholder_path(&img, &paths.cache_dir, false),
+        None
+    );
+    let img_key =
+        bgpicker_core::startup_placeholder_cache_key(&fs::canonicalize(&img).unwrap(), false)
+            .unwrap();
+    let ph_dir = paths.startup_placeholder_cache_dir();
+    fs::create_dir_all(&ph_dir).unwrap();
+    let img_ph = ph_dir.join(format!("{img_key}.jpg"));
+    fs::write(&img_ph, b"img-jpg").unwrap();
+    assert_eq!(
+        bgpicker_core::cached_startup_placeholder_path(&img, &paths.cache_dir, false).as_deref(),
+        Some(img_ph.as_path())
+    );
+    let vid_key =
+        bgpicker_core::startup_placeholder_cache_key(&fs::canonicalize(&video).unwrap(), true)
+            .unwrap();
+    let vid_ph = ph_dir.join(format!("{vid_key}.jpg"));
+    fs::write(&vid_ph, b"vid-jpg").unwrap();
+    assert_eq!(
+        bgpicker_core::cached_startup_placeholder_path(&video, &paths.cache_dir, true).as_deref(),
+        Some(vid_ph.as_path())
+    );
+
+    let toggle_req = Request::StartupPlaceholder {
+        action: bgpicker_core::BackdropAction::Off,
+    };
+    assert_eq!(
+        serde_json::from_str::<Request>(&serde_json::to_string(&toggle_req).unwrap()).unwrap(),
+        toggle_req
+    );
+    let cache_req = Request::PlaceholderCache {
+        action: bgpicker_core::BackdropAction::Toggle,
+    };
+    assert_eq!(
+        serde_json::from_str::<Request>(&serde_json::to_string(&cache_req).unwrap()).unwrap(),
+        cache_req
+    );
 }

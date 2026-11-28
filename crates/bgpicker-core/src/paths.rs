@@ -290,6 +290,36 @@ impl BgPickerPaths {
         self.state_dir.join("video-mode")
     }
 
+    pub fn startup_placeholder_front_pid_file(&self) -> PathBuf {
+        self.state_dir.join("startup-placeholder-front.pid")
+    }
+
+    pub fn startup_placeholder_back_pid_file(&self) -> PathBuf {
+        self.state_dir.join("startup-placeholder-back.pid")
+    }
+
+    /// Advisory `flock` lock file preventing duplicate concurrent `bgpicker-splash` instances.
+    pub fn startup_placeholder_lock_file(&self) -> PathBuf {
+        self.state_dir.join("startup-placeholder.lock")
+    }
+
+    pub fn startup_placeholder_file(&self) -> PathBuf {
+        self.state_dir.join("startup_placeholder")
+    }
+
+    pub fn placeholder_cache_file(&self) -> PathBuf {
+        self.state_dir.join("placeholder_cache")
+    }
+
+    pub fn startup_placeholder_cache_dir(&self) -> PathBuf {
+        self.cache_dir.join("startup-placeholder")
+    }
+
+    /// Pre-scaled zero-decode `BGPX` bitmap for the currently active foreground placeholder.
+    pub fn startup_splash_fg_bin_file(&self) -> PathBuf {
+        self.cache_dir.join("startup-splash-fg.bin")
+    }
+
     /// Legacy compatibility blur pointer (`~/.cache/current_swaybg_img`).
     pub fn legacy_swaybg_cache_file(&self) -> PathBuf {
         self.home_dir.join(".cache/current_swaybg_img")
@@ -334,8 +364,43 @@ fn env_path(key: &str) -> Option<PathBuf> {
     }
 }
 
+/// Resolves the bgpicker repository/project directory from CLI override, `BGPICKER_DIR`,
+/// current directory, or ancestors of the running executable.
+pub fn resolve_project_dir(explicit: Option<PathBuf>) -> PathBuf {
+    if let Some(dir) = explicit {
+        return dir;
+    }
+    if let Some(env_dir) = env::var_os("BGPICKER_DIR").filter(|s| !s.is_empty()) {
+        return PathBuf::from(env_dir);
+    }
+    if let Ok(cwd) = env::current_dir() {
+        if looks_like_project_dir(&cwd) {
+            return cwd;
+        }
+    }
+    if let Ok(exe) = env::current_exe() {
+        let mut cur = exe.parent();
+        while let Some(dir) = cur {
+            if looks_like_project_dir(dir) {
+                return dir.to_path_buf();
+            }
+            cur = dir.parent();
+        }
+    }
+    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn looks_like_project_dir(dir: &Path) -> bool {
+    dir.join("shell.qml").is_file()
+        || (dir.join("wallpapers").is_dir() && dir.join("dynamic").is_dir())
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// Snapshot of persisted `~/.local/state/bgpicker/*` files.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedState {
     pub engine: EngineKind,
@@ -344,6 +409,25 @@ pub struct PersistedState {
     pub current_wallpaper: Option<PathBuf>,
     pub video_wallpaper: Option<PathBuf>,
     pub video_mode: VideoMode,
+    #[serde(default = "default_true")]
+    pub startup_placeholder: bool,
+    #[serde(default = "default_true")]
+    pub placeholder_cache: bool,
+}
+
+impl Default for PersistedState {
+    fn default() -> Self {
+        Self {
+            engine: EngineKind::default(),
+            mode: WallpaperMode::default(),
+            backdrop_parallax: BackdropParallax::default(),
+            current_wallpaper: None,
+            video_wallpaper: None,
+            video_mode: VideoMode::default(),
+            startup_placeholder: true,
+            placeholder_cache: true,
+        }
+    }
 }
 
 impl PersistedState {
@@ -368,6 +452,8 @@ impl PersistedState {
         let video_mode = read_trimmed(&paths.video_mode_file())
             .and_then(|s| VideoMode::from_str(&s).ok())
             .unwrap_or_default();
+        let startup_placeholder = read_on_off_default_on(&paths.startup_placeholder_file());
+        let placeholder_cache = read_on_off_default_on(&paths.placeholder_cache_file());
 
         Self {
             engine,
@@ -376,8 +462,14 @@ impl PersistedState {
             current_wallpaper,
             video_wallpaper,
             video_mode,
+            startup_placeholder,
+            placeholder_cache,
         }
     }
+}
+
+fn read_on_off_default_on(path: &Path) -> bool {
+    !matches!(read_trimmed(path).as_deref(), Some("off"))
 }
 
 fn read_trimmed(path: &Path) -> Option<String> {

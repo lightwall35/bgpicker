@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -119,6 +120,9 @@ pub enum RenderCommand {
         parallax: ParallaxSettings,
         kawase: KawaseSettings,
     },
+    WaitPresented {
+        reply: SyncSender<()>,
+    },
     TrimIdle,
     Clear,
     Shutdown,
@@ -160,6 +164,15 @@ impl RendererHandle {
 
     pub fn snapshots(&self) -> Vec<OutputSnapshot> {
         self.snapshots.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Blocks until every configured output has swapped a live frame and received
+    /// Wayland `wl_surface.frame` acknowledgement, bounded by `timeout`.
+    pub fn wait_presented(&self, timeout: Duration) {
+        let (tx, rx) = mpsc::sync_channel(1);
+        if self.send(RenderCommand::WaitPresented { reply: tx }).is_ok() {
+            let _ = rx.recv_timeout(timeout);
+        }
     }
 }
 
@@ -214,6 +227,9 @@ struct LayerSurfaceSlot {
     scale_120: u32,
     configured: bool,
     waiting_frame_since: Option<Instant>,
+    committed_serial: u64,
+    pending_frame_serial: u64,
+    acknowledged_serial: u64,
     pipeline: LayerPipeline,
 }
 
@@ -273,6 +289,9 @@ impl LayerSurfaceSlot {
             scale_120,
             configured: false,
             waiting_frame_since: None,
+            committed_serial: 0,
+            pending_frame_serial: 0,
+            acknowledged_serial: 0,
             pipeline: LayerPipeline::new(role, initial_parallax),
         }
     }
@@ -397,6 +416,7 @@ struct WaylandApp {
     _conn: Connection,
     active: ActiveState,
     snapshots: Arc<Mutex<Vec<OutputSnapshot>>>,
+    present_waiters: Vec<SyncSender<()>>,
     loop_signal: LoopSignal,
     last_tick: Instant,
 }
@@ -405,6 +425,29 @@ impl WaylandApp {
     fn sync_snapshots(&self) {
         if let Ok(mut guard) = self.snapshots.lock() {
             *guard = self.outputs.iter().map(OutputSurfaceSet::snapshot).collect();
+        }
+    }
+
+    fn all_outputs_presented(&self) -> bool {
+        !self.outputs.is_empty()
+            && self.outputs.iter().all(|out| {
+                let wp_ok = out.wallpaper.configured
+                    && out.wallpaper.committed_serial > 0
+                    && out.wallpaper.acknowledged_serial >= out.wallpaper.committed_serial;
+                let bg_ok = out
+                    .backdrop
+                    .as_ref()
+                    .is_none_or(|b| !b.configured || b.committed_serial > 0);
+                wp_ok && bg_ok
+            })
+    }
+
+    fn notify_present_waiters(&mut self) {
+        if self.present_waiters.is_empty() || !self.all_outputs_presented() {
+            return;
+        }
+        for waiter in self.present_waiters.drain(..) {
+            let _ = waiter.send(());
         }
     }
 
@@ -484,6 +527,8 @@ impl WaylandApp {
             wallpaper,
         });
         self.sync_snapshots();
+        let _ = self._conn.flush();
+        self.notify_present_waiters();
     }
 
     fn find_slot_mut_by_layer<'a>(
@@ -777,6 +822,9 @@ impl WaylandApp {
                     }
                 }
             }
+            RenderCommand::WaitPresented { reply } => {
+                self.present_waiters.push(reply);
+            }
             RenderCommand::TrimIdle => {
                 self.active.wallpaper_frame = None;
                 self.active.backdrop_frame = None;
@@ -828,6 +876,8 @@ impl WaylandApp {
             }
         }
         self.sync_snapshots();
+        let _ = self._conn.flush();
+        self.notify_present_waiters();
     }
 
     fn any_animating(&self) -> bool {
@@ -873,10 +923,12 @@ fn render_slot(
         return;
     }
 
-    if slot.pipeline.is_animating() {
+    let next_serial = slot.committed_serial + 1;
+    if slot.pipeline.is_animating() || slot.pending_frame_serial < next_serial {
         let wl_surface = slot.layer.wl_surface();
         wl_surface.frame(qh, FrameCallbackData(wl_surface.clone()));
         slot.waiting_frame_since = Some(Instant::now());
+        slot.pending_frame_serial = next_serial;
     }
 
     slot.layer
@@ -884,6 +936,8 @@ fn render_slot(
         .damage_buffer(0, 0, w as i32, h as i32);
     if let Err(err) = egl.swap_buffers(egl_surface) {
         warn!("bgpicker-gfx eglSwapBuffers error: {err}");
+    } else {
+        slot.committed_serial = next_serial;
     }
 }
 
@@ -936,8 +990,10 @@ impl CompositorHandler for WaylandApp {
     ) {
         if let Some(slot) = Self::find_slot_mut_by_wl_surface(&mut self.outputs, surface) {
             slot.waiting_frame_since = None;
+            slot.acknowledged_serial = slot.acknowledged_serial.max(slot.pending_frame_serial);
         }
         self.render_due(qh);
+        self.notify_present_waiters();
     }
 
     fn surface_enter(
@@ -1027,6 +1083,8 @@ impl LayerShellHandler for WaylandApp {
             }
         }
         self.sync_snapshots();
+        let _ = self._conn.flush();
+        self.notify_present_waiters();
     }
 
     fn configure(
@@ -1178,6 +1236,7 @@ impl WaylandRenderer {
             _conn: conn.clone(),
             active,
             snapshots: Arc::clone(&snapshots),
+            present_waiters: Vec::new(),
             loop_signal,
             last_tick: Instant::now(),
         };

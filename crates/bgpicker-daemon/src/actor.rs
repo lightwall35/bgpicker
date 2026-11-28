@@ -11,7 +11,9 @@ use std::time::Duration;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use bgpicker_core::catalog::VIDEO_EXTENSIONS;
+use bgpicker_core::catalog::{
+    cached_startup_placeholder_path, prepare_startup_placeholder,
+};
 use bgpicker_core::config::{
     read_settings_json, resolve_transition, set_transition_type, BgPickerConfig,
 };
@@ -24,7 +26,11 @@ use bgpicker_core::protocol::{
     BackdropAction, BackdropOverride, ClearCacheReport, DaemonStatus, EngineAction, ModeAction,
     OutputStatus, Request, Response, ResponseData, VideoModeAction,
 };
-use bgpicker_gfx::{FrameModeTargets, KawaseSettings, LayerTargets};
+use bgpicker_core::{
+    read_splash_header, retire_startup_placeholders, write_splash_bin_from_packed,
+};
+pub use bgpicker_core::list_videos_sorted;
+use bgpicker_gfx::{FrameInput, FrameModeTargets, KawaseSettings, LayerTargets, PixelFormat, TransitionSpec};
 
 use crate::renderer::{to_gfx_parallax, to_gfx_transition, RendererBackend};
 use crate::video::VideoBackend;
@@ -39,6 +45,8 @@ pub struct SharedStatusSnapshot {
     pub video_mode: VideoMode,
     pub current_video: Option<PathBuf>,
     pub backdrop_parallax: bool,
+    pub startup_placeholder: bool,
+    pub placeholder_cache: bool,
     pub config: BgPickerConfig,
     pub busy: bool,
     pub niri_connected: bool,
@@ -163,6 +171,8 @@ impl DaemonActorHandle {
             video_mode: snap.video_mode,
             current_video: snap.current_video,
             backdrop_parallax: snap.backdrop_parallax,
+            startup_placeholder: snap.startup_placeholder,
+            placeholder_cache: snap.placeholder_cache,
             transition: snap.config.transition,
             parallax: snap.config.parallax,
             busy: snap.busy,
@@ -199,6 +209,8 @@ impl DaemonActor {
             video_mode: persisted.video_mode,
             current_video: persisted.video_wallpaper.clone(),
             backdrop_parallax: persisted.backdrop_parallax.is_on(),
+            startup_placeholder: persisted.startup_placeholder,
+            placeholder_cache: persisted.placeholder_cache,
             config,
             busy: false,
             niri_connected: false,
@@ -231,6 +243,7 @@ impl DaemonActor {
             last_output_progress: std::collections::HashMap::new(),
             last_error: None,
             restored_once: false,
+            startup_seed: None,
             snapshot,
         };
 
@@ -282,7 +295,13 @@ struct ActorRunner {
     last_output_progress: std::collections::HashMap<String, f32>,
     last_error: Option<String>,
     restored_once: bool,
+    startup_seed: Option<StartupSeedKind>,
     snapshot: Arc<RwLock<SharedStatusSnapshot>>,
+}
+
+enum StartupSeedKind {
+    Full { wallpaper: PathBuf },
+    Video { seeded: bool },
 }
 
 impl ActorRunner {
@@ -318,6 +337,8 @@ impl ActorRunner {
                 video_mode: self.state.video_mode,
                 current_video: self.state.video_wallpaper.clone(),
                 backdrop_parallax: self.state.backdrop_parallax.is_on(),
+                startup_placeholder: self.state.startup_placeholder,
+                placeholder_cache: self.state.placeholder_cache,
                 config: self.config,
                 busy,
                 niri_connected: self.niri_connected,
@@ -419,6 +440,14 @@ impl ActorRunner {
                 Ok(()) => Response::ok_empty(),
                 Err(e) => Response::err(e),
             },
+            Request::StartupSeed { placeholder } => match self.cmd_startup_seed(placeholder) {
+                Ok(status) => Response::ok(ResponseData::Message(status.into())),
+                Err(e) => Response::err(e),
+            },
+            Request::StartupSettle => match self.cmd_startup_settle() {
+                Ok(()) => Response::ok_empty(),
+                Err(e) => Response::err(e),
+            },
             Request::Restore => match self.cmd_restore() {
                 Ok(()) => Response::ok_empty(),
                 Err(e) => Response::err(e),
@@ -447,6 +476,18 @@ impl ActorRunner {
             Request::BackdropParallax { action } => match self.cmd_backdrop_parallax(action) {
                 Ok(()) => Response::ok(ResponseData::Message(
                     self.state.backdrop_parallax.as_str().into(),
+                )),
+                Err(e) => Response::err(e),
+            },
+            Request::StartupPlaceholder { action } => match self.cmd_startup_placeholder(action) {
+                Ok(enabled) => Response::ok(ResponseData::Message(
+                    if enabled { "on" } else { "off" }.into(),
+                )),
+                Err(e) => Response::err(e),
+            },
+            Request::PlaceholderCache { action } => match self.cmd_placeholder_cache(action) {
+                Ok(enabled) => Response::ok(ResponseData::Message(
+                    if enabled { "on" } else { "off" }.into(),
                 )),
                 Err(e) => Response::err(e),
             },
@@ -544,12 +585,19 @@ impl ActorRunner {
         Ok(())
     }
 
+    fn wait_and_retire_startup_placeholder(&self) {
+        self.renderer
+            .wait_presented(Duration::from_millis(1200));
+        retire_startup_placeholders(&self.paths, &[]);
+    }
+
     fn cmd_startup(&mut self) -> Result<(), String> {
         if self.restored_once {
             return Ok(());
         }
+        self.startup_seed = None;
         self.restored_once = true;
-        match self.state.engine {
+        let res = match self.state.engine {
             EngineKind::Video => {
                 if let Err(err) = self.cmd_apply_video(None, None, true, BackdropOverride::Keep) {
                     log::warn!("BgPicker: video restore failed ({err}); falling back to static");
@@ -570,13 +618,13 @@ impl ActorRunner {
             EngineKind::Full => {
                 if let Some(wp) = self.state.current_wallpaper.clone() {
                     if wp.is_file() {
-                        return self.cmd_apply_static(
+                        self.cmd_apply_static(
                             &wp,
                             Some(self.state.mode),
                             true,
                             EngineKind::Full,
                             BackdropOverride::Keep,
-                        );
+                        )?;
                     }
                 }
                 Ok(())
@@ -595,12 +643,155 @@ impl ActorRunner {
                 }
                 Ok(())
             }
+        };
+        if res.is_ok() {
+            self.wait_and_retire_startup_placeholder();
+        }
+        res
+    }
+
+    fn cmd_startup_seed(&mut self, placeholder: Option<PathBuf>) -> Result<&'static str, String> {
+        if self.restored_once {
+            return Ok("already_restored");
+        }
+        match self.state.engine {
+            EngineKind::Full => {
+                let Some(wp) = self.state.current_wallpaper.clone().filter(|p| p.is_file()) else {
+                    self.startup_seed = None;
+                    return Ok("unseeded");
+                };
+                let canonical = fs::canonicalize(&wp).map_err(|e| {
+                    format!("BgPicker: failed to resolve {}: {e}", wp.display())
+                })?;
+                let frame = self
+                    .renderer
+                    .decode_image(&canonical, self.config.parallax.max_texture_size)?;
+                // Present initial frame centered (`mode_blend = 0.0`) so it visually matches
+                // the temporary static placeholder before smoothly gliding into parallax.
+                self.renderer.apply_frame(
+                    frame,
+                    TransitionSpec::instant(),
+                    LayerTargets::Both,
+                    FrameModeTargets {
+                        wallpaper_parallax: Some(false),
+                        backdrop_parallax: Some(false),
+                    },
+                )?;
+                self.startup_seed = Some(StartupSeedKind::Full {
+                    wallpaper: canonical,
+                });
+                self.wait_and_retire_startup_placeholder();
+                Ok("seeded")
+            }
+            EngineKind::Video => {
+                let candidate = placeholder
+                    .filter(|p| p.is_file())
+                    .or_else(|| self.state.current_wallpaper.clone().filter(|p| p.is_file()));
+                if let Some(ph) = candidate {
+                    let canonical = fs::canonicalize(&ph).map_err(|e| {
+                        format!("BgPicker: failed to resolve {}: {e}", ph.display())
+                    })?;
+                    match self
+                        .renderer
+                        .decode_image(&canonical, self.config.parallax.max_texture_size)
+                    {
+                        Ok(frame) => {
+                            self.renderer.apply_frame(
+                                frame,
+                                TransitionSpec::instant(),
+                                LayerTargets::Both,
+                                FrameModeTargets {
+                                    wallpaper_parallax: Some(false),
+                                    backdrop_parallax: Some(false),
+                                },
+                            )?;
+                            self.startup_seed = Some(StartupSeedKind::Video { seeded: true });
+                            self.wait_and_retire_startup_placeholder();
+                            return Ok("seeded");
+                        }
+                        Err(err) => {
+                            log::warn!("BgPicker: placeholder decode failed ({err})");
+                        }
+                    }
+                }
+                self.startup_seed = Some(StartupSeedKind::Video { seeded: false });
+                Ok("unseeded")
+            }
+            EngineKind::Simple => {
+                self.startup_seed = None;
+                Ok("unseeded")
+            }
+        }
+    }
+
+    fn cmd_startup_settle(&mut self) -> Result<(), String> {
+        let Some(seed) = self.startup_seed.take() else {
+            return self.cmd_startup();
+        };
+        if self.restored_once {
+            return Ok(());
+        }
+        match seed {
+            StartupSeedKind::Full { wallpaper } => {
+                self.restored_once = true;
+                let fg_parallax = self.state.mode == WallpaperMode::Parallax;
+                let bg_parallax = self.state.backdrop_parallax.is_on();
+                let dur = self.config.parallax.mode_transition_ms;
+                self.apply_layer_modes(
+                    fg_parallax,
+                    bg_parallax,
+                    dur,
+                    dur,
+                    fg_parallax,
+                    bg_parallax,
+                )?;
+                spawn_compat_blur_update(&self.paths, &wallpaper);
+                if self.state.placeholder_cache {
+                    let dst = self.target_splash_pixel_size();
+                    let bin = self.paths.startup_splash_fg_bin_file();
+                    let splash_target = (!splash_matches_size(&bin, dst.0, dst.1)).then_some(
+                        SplashBinTarget {
+                            bin_path: bin,
+                            dst_size: dst,
+                            frame: None,
+                        },
+                    );
+                    spawn_placeholder_cache_update(&self.paths, &wallpaper, false, splash_target);
+                }
+                retire_startup_placeholders(&self.paths, &[]);
+                Ok(())
+            }
+            StartupSeedKind::Video { seeded } => {
+                self.restored_once = true;
+                if let Err(err) =
+                    self.cmd_apply_video(None, None, !seeded, BackdropOverride::Keep)
+                {
+                    log::warn!("BgPicker: video restore failed ({err}); falling back to static");
+                    if let Some(wp) = self.state.current_wallpaper.clone() {
+                        if wp.is_file() {
+                            return self.cmd_apply_static(
+                                &wp,
+                                Some(WallpaperMode::Awww),
+                                !seeded,
+                                EngineKind::Simple,
+                                BackdropOverride::Keep,
+                            );
+                        }
+                    }
+                }
+                if seeded {
+                    retire_startup_placeholders(&self.paths, &[]);
+                } else {
+                    self.wait_and_retire_startup_placeholder();
+                }
+                Ok(())
+            }
         }
     }
 
     fn cmd_restore(&mut self) -> Result<(), String> {
         self.restored_once = true;
-        match self.state.engine {
+        let res = match self.state.engine {
             EngineKind::Video => {
                 if self.state.current_video_available(&self.project_dir).is_some() {
                     self.cmd_apply_video(None, None, true, BackdropOverride::Keep)
@@ -611,13 +802,13 @@ impl ActorRunner {
             EngineKind::Full => {
                 if let Some(wp) = self.state.current_wallpaper.clone() {
                     if wp.is_file() {
-                        return self.cmd_apply_static(
+                        self.cmd_apply_static(
                             &wp,
                             Some(self.state.mode),
                             true,
                             EngineKind::Full,
                             BackdropOverride::Keep,
-                        );
+                        )?;
                     }
                 }
                 Ok(())
@@ -636,7 +827,11 @@ impl ActorRunner {
                 }
                 Ok(())
             }
+        };
+        if res.is_ok() {
+            self.wait_and_retire_startup_placeholder();
         }
+        res
     }
 
     fn cmd_apply_static(
@@ -662,6 +857,17 @@ impl ActorRunner {
         let frame = self
             .renderer
             .decode_image(&canonical, self.config.parallax.max_texture_size)?;
+        let splash_dst = self.target_splash_pixel_size();
+        let splash_bin = self.paths.startup_splash_fg_bin_file();
+        let splash_target = (self.state.placeholder_cache
+            && (self.state.engine != target_engine
+                || self.state.current_wallpaper.as_deref() != Some(canonical.as_path())
+                || !splash_matches_size(&splash_bin, splash_dst.0, splash_dst.1)))
+        .then(|| SplashBinTarget {
+            bin_path: splash_bin,
+            dst_size: splash_dst,
+            frame: Some(frame.clone()),
+        });
 
         let target_mode = match target_engine {
             EngineKind::Simple => WallpaperMode::Awww,
@@ -720,6 +926,9 @@ impl ActorRunner {
         self.restored_once = true;
 
         spawn_compat_blur_update(&self.paths, &canonical);
+        if self.state.placeholder_cache {
+            spawn_placeholder_cache_update(&self.paths, &canonical, false, splash_target);
+        }
         Ok(())
     }
 
@@ -795,6 +1004,63 @@ impl ActorRunner {
             .map_err(|e| e.to_string())?;
         self.state.backdrop_parallax = target;
         Ok(())
+    }
+
+    fn cmd_startup_placeholder(&mut self, action: BackdropAction) -> Result<bool, String> {
+        let target = match action {
+            BackdropAction::On => true,
+            BackdropAction::Off => false,
+            BackdropAction::Toggle => !self.state.startup_placeholder,
+        };
+        if target != self.state.startup_placeholder {
+            atomic_write_text(
+                &self.paths.startup_placeholder_file(),
+                if target { "on" } else { "off" },
+            )
+            .map_err(|e| e.to_string())?;
+            self.state.startup_placeholder = target;
+        }
+        Ok(target)
+    }
+
+    fn cmd_placeholder_cache(&mut self, action: BackdropAction) -> Result<bool, String> {
+        let target = match action {
+            BackdropAction::On => true,
+            BackdropAction::Off => false,
+            BackdropAction::Toggle => !self.state.placeholder_cache,
+        };
+        if target != self.state.placeholder_cache {
+            atomic_write_text(
+                &self.paths.placeholder_cache_file(),
+                if target { "on" } else { "off" },
+            )
+            .map_err(|e| e.to_string())?;
+            self.state.placeholder_cache = target;
+        }
+        if target {
+            let active_is_video = self.state.engine == EngineKind::Video;
+            let dst = self.target_splash_pixel_size();
+            let bin = self.paths.startup_splash_fg_bin_file();
+            if let Some(ref wp) = self.state.current_wallpaper {
+                if wp.is_file() {
+                    let splash = (!active_is_video).then(|| SplashBinTarget {
+                        bin_path: bin.clone(),
+                        dst_size: dst,
+                        frame: None,
+                    });
+                    spawn_placeholder_cache_update(&self.paths, wp, false, splash);
+                }
+            }
+            if let Some(vid) = self.state.current_video_available(&self.project_dir) {
+                let splash = active_is_video.then_some(SplashBinTarget {
+                    bin_path: bin,
+                    dst_size: dst,
+                    frame: None,
+                });
+                spawn_placeholder_cache_update(&self.paths, &vid, true, splash);
+            }
+        }
+        Ok(target)
     }
 
     fn cmd_apply_video(
@@ -921,11 +1187,34 @@ impl ActorRunner {
             self.state.backdrop_parallax = target_backdrop;
         }
 
+        let splash_dst = self.target_splash_pixel_size();
+        let splash_bin = self.paths.startup_splash_fg_bin_file();
+        let splash_target = (self.state.placeholder_cache
+            && (self.state.engine != EngineKind::Video
+                || self.state.video_wallpaper.as_deref() != Some(canonical.as_path())
+                || !splash_matches_size(&splash_bin, splash_dst.0, splash_dst.1)))
+        .then_some(SplashBinTarget {
+            bin_path: splash_bin,
+            dst_size: splash_dst,
+            frame: None,
+        });
         self.state.engine = EngineKind::Video;
-        self.state.video_wallpaper = Some(canonical);
+        self.state.video_wallpaper = Some(canonical.clone());
         self.state.video_mode = target_mode;
         self.restored_once = true;
+        if self.state.placeholder_cache {
+            spawn_placeholder_cache_update(&self.paths, &canonical, true, splash_target);
+        }
         Ok(())
+    }
+
+    fn target_splash_pixel_size(&self) -> (u32, u32) {
+        self.renderer
+            .snapshots()
+            .into_iter()
+            .map(|o| o.wallpaper.pixel_size)
+            .find(|&(w, h)| w > 0 && h > 0)
+            .unwrap_or((2560, 1600))
     }
 
     fn cmd_set_engine(&mut self, action: EngineAction) -> Result<(), String> {
@@ -1051,30 +1340,6 @@ pub fn find_first_video(dir: &Path) -> Option<PathBuf> {
     list_videos_sorted(dir).into_iter().next()
 }
 
-/// Lists all supported videos in `dir` sorted by `(name.to_lowercase(), name)`.
-pub fn list_videos_sorted(dir: &Path) -> Vec<PathBuf> {
-    let Ok(rd) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut entries: Vec<(String, PathBuf)> = Vec::new();
-    for entry in rd.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-            continue;
-        };
-        let lower = ext.to_ascii_lowercase();
-        if VIDEO_EXTENSIONS.contains(&lower.as_str()) {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            entries.push((name, path));
-        }
-    }
-    entries.sort_by(|(a, _), (b, _)| (a.to_lowercase(), a).cmp(&(b.to_lowercase(), b)));
-    entries.into_iter().map(|(_, p)| p).collect()
-}
-
 /// Best-effort async update of `~/.cache/bgpicker/blur/*` and `~/.cache/current_swaybg_img`
 /// so external compositor tools (e.g. lockscreen) keep finding the blurred variant.
 fn spawn_compat_blur_update(paths: &BgPickerPaths, original: &Path) {
@@ -1085,6 +1350,79 @@ fn spawn_compat_blur_update(paths: &BgPickerPaths, original: &Path) {
         .name("bgpicker-compat-blur".into())
         .spawn(move || {
             let _ = update_compat_blur(&blur_dir, &legacy_file, &original);
+        });
+}
+
+struct SplashBinTarget {
+    bin_path: PathBuf,
+    dst_size: (u32, u32),
+    frame: Option<FrameInput>,
+}
+
+fn splash_matches_size(path: &Path, dst_w: u32, dst_h: u32) -> bool {
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    matches!(read_splash_header(&mut file), Ok((w, h)) if w == dst_w && h == dst_h)
+}
+
+fn write_splash_from_frame(bin_path: &Path, frame: &FrameInput, dst_size: (u32, u32)) {
+    let src_is_bgra = match frame.format {
+        PixelFormat::Rgba8 => false,
+        PixelFormat::Bgra8 => true,
+        PixelFormat::Nv12 { .. } => return,
+    };
+    if let Err(err) = write_splash_bin_from_packed(
+        bin_path,
+        frame.width,
+        frame.height,
+        frame.stride_bytes,
+        &frame.data,
+        src_is_bgra,
+        dst_size.0,
+        dst_size.1,
+    ) {
+        log::warn!("BgPicker: failed writing {}: {err}", bin_path.display());
+    }
+}
+
+/// Best-effort async generation of high-res startup placeholder JPEG under
+/// `~/.cache/bgpicker/startup-placeholder/*` plus pre-rendered `BGPX` bitmap
+/// (`startup-splash-fg.bin`) for zero-decode `bgpicker-splash` boot.
+fn spawn_placeholder_cache_update(
+    paths: &BgPickerPaths,
+    media: &Path,
+    is_video: bool,
+    splash_target: Option<SplashBinTarget>,
+) {
+    if cached_startup_placeholder_path(media, &paths.cache_dir, is_video).is_some()
+        && splash_target.is_none()
+    {
+        return;
+    }
+    let cache_dir = paths.cache_dir.clone();
+    let media = media.to_path_buf();
+    let _ = thread::Builder::new()
+        .name("bgpicker-ph-cache".into())
+        .spawn(move || {
+            let prepared_jpg = prepare_startup_placeholder(&media, &cache_dir, is_video).ok();
+            let Some(splash) = splash_target else {
+                return;
+            };
+            if let Some(ref frame) = splash.frame {
+                write_splash_from_frame(&splash.bin_path, frame, splash.dst_size);
+                return;
+            }
+            let src_img = if is_video {
+                prepared_jpg.or_else(|| cached_startup_placeholder_path(&media, &cache_dir, true))
+            } else {
+                Some(media)
+            };
+            if let Some(path) = src_img {
+                if let Ok(decoded) = FrameInput::from_image_path(&path, 8192) {
+                    write_splash_from_frame(&splash.bin_path, &decoded, splash.dst_size);
+                }
+            }
         });
 }
 
