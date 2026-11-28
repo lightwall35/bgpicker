@@ -7,6 +7,8 @@ pub enum HwAccelPreference {
     /// Try VAAPI (DMA-BUF zero-copy first, then upload), then CUDA/NVDEC, then software.
     #[default]
     Auto,
+    /// Try CUDA/NVDEC first (optimal when rendering on NVIDIA EGL), then VAAPI, then software.
+    CudaFirst,
     /// Require VAAPI (no fallback to CUDA or software).
     VaapiOnly,
     /// Require CUDA/NVDEC (no fallback to VAAPI or software).

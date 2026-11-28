@@ -46,6 +46,7 @@ use crate::frame::FrameInput;
 use crate::layer::{LayerPipeline, LayerRole};
 use crate::math::{KawaseSettings, ParallaxSettings, TransitionSpec};
 use crate::shaders::ShaderPrograms;
+use crate::splash::{ActiveSplash, StartupSplashSpec};
 
 const ACTIVE_TIMER_INTERVAL: Duration = Duration::from_millis(4);
 const IDLE_TIMER_INTERVAL: Duration = Duration::from_millis(50);
@@ -155,6 +156,7 @@ pub struct OutputSnapshot {
 pub struct RendererHandle {
     tx: Sender<RenderCommand>,
     snapshots: Arc<Mutex<Vec<OutputSnapshot>>>,
+    is_nvidia_gpu: bool,
 }
 
 impl RendererHandle {
@@ -164,6 +166,12 @@ impl RendererHandle {
 
     pub fn snapshots(&self) -> Vec<OutputSnapshot> {
         self.snapshots.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Returns `true` when the active Wayland EGL/GL vendor is NVIDIA, so video decoding
+    /// should prefer same-GPU CUDA/NVDEC rather than copying from an unattached iGPU.
+    pub fn prefers_cuda_decode(&self) -> bool {
+        self.is_nvidia_gpu
     }
 
     /// Blocks until every configured output has swapped a live frame and received
@@ -417,6 +425,7 @@ struct WaylandApp {
     active: ActiveState,
     snapshots: Arc<Mutex<Vec<OutputSnapshot>>>,
     present_waiters: Vec<SyncSender<()>>,
+    startup_splash: Option<ActiveSplash>,
     loop_signal: LoopSignal,
     last_tick: Instant,
 }
@@ -443,8 +452,12 @@ impl WaylandApp {
     }
 
     fn notify_present_waiters(&mut self) {
-        if self.present_waiters.is_empty() || !self.all_outputs_presented() {
+        if !self.all_outputs_presented() {
             return;
+        }
+        if let Some(splash) = self.startup_splash.take() {
+            splash.retire();
+            let _ = self._conn.flush();
         }
         for waiter in self.present_waiters.drain(..) {
             let _ = waiter.send(());
@@ -943,6 +956,9 @@ fn render_slot(
 
 impl Drop for WaylandApp {
     fn drop(&mut self) {
+        if let Some(splash) = self.startup_splash.take() {
+            splash.retire();
+        }
         let _ = self.egl.make_fallback_current();
         for mut out in self.outputs.drain(..) {
             out.destroy(&self.egl);
@@ -1192,8 +1208,24 @@ impl WaylandRenderer {
     /// Connects to the active Wayland compositor, binds `zwlr_layer_shell_v1`, `wl_output`,
     /// `wp_viewporter`, and `wp_fractional_scale_manager_v1`, and initializes the EGL/GL pipeline.
     pub fn connect(backdrop_enabled: bool) -> Result<Self> {
+        Self::connect_with_splash(backdrop_enabled, None)
+    }
+
+    /// Connects to Wayland, optionally displaying an immediate in-process `wl_shm` boot splash
+    /// before initializing EGL/shaders, then keeps that splash alive until EGL Frame 1 presents.
+    pub fn connect_with_splash(
+        backdrop_enabled: bool,
+        splash: Option<StartupSplashSpec>,
+    ) -> Result<Self> {
         let conn = Connection::connect_to_env()
             .map_err(|e| GfxError::WaylandConnect(e.to_string()))?;
+
+        // Show `wl_shm` splash BEFORE EGL/GPU initialization so cold-boot driver/shader
+        // warmup never delays Frame 1 or causes multi-process handoff races.
+        let startup_splash = splash
+            .as_ref()
+            .and_then(|spec| ActiveSplash::show(&conn, spec));
+
         let (globals, event_queue) = registry_queue_init::<WaylandApp>(&conn)
             .map_err(|e| GfxError::WaylandGlobal(e.to_string()))?;
         let qh = event_queue.handle();
@@ -1210,6 +1242,7 @@ impl WaylandRenderer {
 
         let wl_display_ptr = conn.backend().display_ptr() as *mut std::ffi::c_void;
         let egl = unsafe { EglContext::new_wayland(wl_display_ptr)? };
+        let is_nvidia_gpu = egl.is_nvidia;
         let programs = ShaderPrograms::compile(&egl.gl, egl.is_gles)?;
 
         let event_loop = EventLoop::<WaylandApp>::try_new()
@@ -1237,6 +1270,7 @@ impl WaylandRenderer {
             active,
             snapshots: Arc::clone(&snapshots),
             present_waiters: Vec::new(),
+            startup_splash,
             loop_signal,
             last_tick: Instant::now(),
         };
@@ -1280,7 +1314,11 @@ impl WaylandRenderer {
             )
             .map_err(|e| GfxError::WaylandDispatch(e.to_string()))?;
 
-        let handle = RendererHandle { tx, snapshots };
+        let handle = RendererHandle {
+            tx,
+            snapshots,
+            is_nvidia_gpu,
+        };
 
         Ok(Self {
             app,

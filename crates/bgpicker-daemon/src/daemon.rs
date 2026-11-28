@@ -1,10 +1,13 @@
+use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use bgpicker_core::niri::{NiriClientConfig, NiriWatcher};
-use bgpicker_core::paths::BgPickerPaths;
+use bgpicker_core::paths::{BgPickerPaths, EngineKind, PersistedState};
 use bgpicker_core::protocol::Request;
+use bgpicker_core::{is_splash_lock_held, resolve_startup_placeholders};
+use bgpicker_gfx::StartupSplashSpec;
 
 use crate::actor::{DaemonActor, DaemonActorHandle};
 use crate::inotify::SettingsWatcher;
@@ -50,10 +53,41 @@ pub struct DaemonInstance {
     stopped: AtomicBool,
 }
 
+fn resolve_in_process_splash(opts: &DaemonOptions) -> Option<StartupSplashSpec> {
+    // Preserve external placeholder process overrides (e.g. integration tests).
+    if env::var_os("BGPICKER_SPLASH").is_some_and(|s| !s.is_empty())
+        || env::var_os("BGPICKER_SWAYBG").is_some_and(|s| !s.is_empty())
+    {
+        return None;
+    }
+    let persisted = PersistedState::load(&opts.paths);
+    if !persisted.startup_placeholder
+        || persisted.engine == EngineKind::Simple
+        || is_splash_lock_held(&opts.paths)
+    {
+        return None;
+    }
+    let (fg_image, bg_image) =
+        resolve_startup_placeholders(&opts.paths, &opts.project_dir, &persisted);
+    if fg_image.is_none() && bg_image.is_none() {
+        return None;
+    }
+    let fg_bin_candidate = opts.paths.startup_splash_fg_bin_file();
+    let fg_bin = (persisted.placeholder_cache && fg_bin_candidate.is_file())
+        .then_some(fg_bin_candidate);
+    Some(StartupSplashSpec {
+        fg_bin,
+        fg_image,
+        bg_image,
+    })
+}
+
 impl DaemonInstance {
     /// Starts the live daemon backed by Wayland+EGL (`GfxRendererBackend`) and FFmpeg (`RealVideoBackend`).
     pub fn start_live(opts: DaemonOptions) -> Result<Self, String> {
-        let renderer: Arc<dyn RendererBackend> = Arc::new(GfxRendererBackend::connect()?);
+        let splash = resolve_in_process_splash(&opts);
+        let renderer: Arc<dyn RendererBackend> =
+            Arc::new(GfxRendererBackend::connect_with_splash(splash)?);
         let video: Arc<dyn VideoBackend> = Arc::new(RealVideoBackend::new(Arc::clone(&renderer)));
         Self::start_with_backends(opts, renderer, video)
     }

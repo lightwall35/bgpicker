@@ -16,6 +16,7 @@ typedef enum BgvHwMode {
     BGV_HW_VAAPI_ONLY = 1,
     BGV_HW_CUDA_ONLY = 2,
     BGV_HW_SOFTWARE_ONLY = 3,
+    BGV_HW_CUDA_FIRST = 4,
 } BgvHwMode;
 
 typedef enum BgvBackendKind {

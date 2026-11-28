@@ -127,7 +127,7 @@ class DeployUninstallTests(unittest.TestCase):
             self.assertEqual(link.resolve(), (self.repo / "target/release" / b).resolve())
 
         kdl = self.niri_cfg.read_text(encoding="utf-8")
-        self.assertEqual(kdl.count("bgpicker-splash"), 1)
+        self.assertNotIn("bgpicker-splash", kdl)
         self.assertEqual(kdl.count("bgpickerctl"), 1)
         self.assertNotIn("wallpaper_engine.sh", kdl)
         self.assertIn('spawn-at-startup "waybar"', kdl)

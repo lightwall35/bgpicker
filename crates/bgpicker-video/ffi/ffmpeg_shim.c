@@ -306,6 +306,10 @@ int bgv_open(
         attempts[nb_attempts++] = AV_HWDEVICE_TYPE_CUDA;
     } else if (hw_mode == BGV_HW_SOFTWARE_ONLY) {
         attempts[nb_attempts++] = AV_HWDEVICE_TYPE_NONE;
+    } else if (hw_mode == BGV_HW_CUDA_FIRST) {
+        attempts[nb_attempts++] = AV_HWDEVICE_TYPE_CUDA;
+        attempts[nb_attempts++] = AV_HWDEVICE_TYPE_VAAPI;
+        attempts[nb_attempts++] = AV_HWDEVICE_TYPE_NONE;
     } else {
         attempts[nb_attempts++] = AV_HWDEVICE_TYPE_VAAPI;
         attempts[nb_attempts++] = AV_HWDEVICE_TYPE_CUDA;

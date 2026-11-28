@@ -83,10 +83,28 @@ impl RealVideoBackend {
             return Ok(());
         }
 
+        let hw_accel = match std::env::var("BGPICKER_VIDEO_HW")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("cuda-first") => HwAccelPreference::CudaFirst,
+            Some("cuda") => HwAccelPreference::CudaOnly,
+            Some("vaapi") => HwAccelPreference::VaapiOnly,
+            Some("software") => HwAccelPreference::SoftwareOnly,
+            Some("auto") => HwAccelPreference::Auto,
+            _ => {
+                if self.renderer.prefers_cuda_decode() {
+                    HwAccelPreference::CudaFirst
+                } else {
+                    HwAccelPreference::Auto
+                }
+            }
+        };
         let (pump_tx, pump_rx) = mpsc::channel::<PumpSignal>();
         let cb_tx = pump_tx.clone();
         let config = DecoderConfig {
-            hw_accel: HwAccelPreference::Auto,
+            hw_accel,
             prefer_dmabuf: false,
             cpu_format: CpuPixelFormat::Nv12,
             sw_threads: 0,

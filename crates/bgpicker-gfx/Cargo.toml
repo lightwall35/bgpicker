@@ -6,6 +6,7 @@ license = "MIT"
 description = "Unified Wayland layer-shell GPU renderer for bgpicker wallpaper and backdrop layers"
 
 [dependencies]
+bgpicker-core = { path = "../bgpicker-core" }
 bytemuck = { version = "1.25", features = ["derive"] }
 calloop = "0.14"
 glow = "0.18"

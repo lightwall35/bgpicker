@@ -4,8 +4,9 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::io::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::ptr;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -282,12 +283,136 @@ pub fn resolve_startup_placeholders(
         EngineKind::Simple => None,
     };
 
-    let cached_blur = fs::read_to_string(paths.legacy_swaybg_cache_file())
-        .ok()
-        .map(|s| PathBuf::from(s.trim()))
-        .filter(|p| p.is_file());
+    let cached_blur = if persisted.engine == EngineKind::Video {
+        None
+    } else {
+        fs::read_to_string(paths.legacy_swaybg_cache_file())
+            .ok()
+            .map(|s| PathBuf::from(s.trim()))
+            .filter(|p| p.is_file())
+    };
     let bg = cached_blur.or_else(|| fg.clone());
     (fg, bg)
+}
+
+/// Anonymous shared memory (`memfd_create` + `MAP_SHARED`) ready for `wl_shm.create_pool`.
+pub struct MemfdBuffer {
+    fd: OwnedFd,
+    byte_len: usize,
+    width: u32,
+    height: u32,
+}
+
+impl MemfdBuffer {
+    pub fn fd(&self) -> &OwnedFd {
+        &self.fd
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.byte_len
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+}
+
+struct MmapGuard {
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+
+impl MmapGuard {
+    fn new(fd: i32, len: usize) -> io::Result<Self> {
+        let ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { ptr, len })
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.cast::<u8>(), self.len) }
+    }
+}
+
+impl Drop for MmapGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = libc::munmap(self.ptr, self.len);
+        }
+    }
+}
+
+fn create_memfd(size: usize) -> io::Result<OwnedFd> {
+    let raw_fd = unsafe { libc::memfd_create(c"bgpicker-splash".as_ptr(), libc::MFD_CLOEXEC) };
+    if raw_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let rc = unsafe { libc::ftruncate(fd.as_raw_fd(), size as libc::off_t) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+/// Copies tightly packed `Xrgb8888` pixels into an anonymous `memfd` shared memory buffer.
+pub fn write_pixels_to_memfd(width: u32, height: u32, pixels: &[u8]) -> io::Result<MemfdBuffer> {
+    let fd = create_memfd(pixels.len())?;
+    {
+        let mut map = MmapGuard::new(fd.as_raw_fd(), pixels.len())?;
+        map.as_mut_slice().copy_from_slice(pixels);
+    }
+    Ok(MemfdBuffer {
+        fd,
+        byte_len: pixels.len(),
+        width,
+        height,
+    })
+}
+
+/// Fast path: streams pre-rendered `BGPX` pixel data straight into `wl_shm` `memfd`
+/// if dimensions match `(target_w, target_h)`.
+pub fn try_load_bgpx_exact_into_memfd(
+    bin_path: &Path,
+    target_w: u32,
+    target_h: u32,
+) -> io::Result<Option<MemfdBuffer>> {
+    let mut file = File::open(bin_path)?;
+    let (w, h) = read_splash_header(&mut file)?;
+    if w != target_w || h != target_h {
+        return Ok(None);
+    }
+    let byte_len = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|p| p.checked_mul(4))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "pixel buffer overflow"))?;
+
+    let fd = create_memfd(byte_len)?;
+    {
+        let mut map = MmapGuard::new(fd.as_raw_fd(), byte_len)?;
+        file.read_exact(map.as_mut_slice())?;
+    }
+    Ok(Some(MemfdBuffer {
+        fd,
+        byte_len,
+        width: w,
+        height: h,
+    }))
 }
 
 /// Exclusive non-blocking advisory lock held by the active `bgpicker-splash` process.

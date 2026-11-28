@@ -6,8 +6,8 @@ use std::time::Duration;
 use bgpicker_core::{ParallaxSettings as CoreParallaxSettings, ResolvedTransition};
 use bgpicker_gfx::{
     FrameInput, FrameModeTargets, KawaseSettings, LayerTargets, OutputSnapshot,
-    ParallaxSettings as GfxParallaxSettings, RenderCommand, RendererHandle, TransitionEffect,
-    TransitionSpec, WaylandRenderer,
+    ParallaxSettings as GfxParallaxSettings, RenderCommand, RendererHandle, StartupSplashSpec,
+    TransitionEffect, TransitionSpec, WaylandRenderer,
 };
 
 /// Converts core `ParallaxSettings` to `bgpicker-gfx` `ParallaxSettings`.
@@ -75,6 +75,9 @@ pub trait RendererBackend: Send + Sync {
     fn trim_idle(&self) -> Result<(), String>;
     fn clear(&self) -> Result<(), String>;
     fn wait_presented(&self, _timeout: Duration) {}
+    fn prefers_cuda_decode(&self) -> bool {
+        false
+    }
     fn shutdown(&self);
     fn snapshots(&self) -> Vec<OutputSnapshot>;
 }
@@ -89,10 +92,16 @@ impl GfxRendererBackend {
     /// Connects to Wayland (`backdrop_enabled = true`) on a dedicated `bgpicker-wayland` thread
     /// and waits for connection/EGL initialization before returning.
     pub fn connect() -> Result<Self, String> {
+        Self::connect_with_splash(None)
+    }
+
+    /// Connects to Wayland (`backdrop_enabled = true`), optionally presenting an in-process
+    /// pre-EGL `wl_shm` boot splash until the real EGL surface presents its first frame.
+    pub fn connect_with_splash(splash: Option<StartupSplashSpec>) -> Result<Self, String> {
         let (init_tx, init_rx) = mpsc::channel::<Result<RendererHandle, String>>();
         let handle_thread = thread::Builder::new()
             .name("bgpicker-wayland".into())
-            .spawn(move || match WaylandRenderer::connect(true) {
+            .spawn(move || match WaylandRenderer::connect_with_splash(true, splash) {
                 Ok(renderer) => {
                     let handle = renderer.handle();
                     let _ = init_tx.send(Ok(handle));
@@ -208,6 +217,10 @@ impl RendererBackend for GfxRendererBackend {
 
     fn wait_presented(&self, timeout: Duration) {
         self.handle.wait_presented(timeout);
+    }
+
+    fn prefers_cuda_decode(&self) -> bool {
+        self.handle.prefers_cuda_decode()
     }
 
     fn shutdown(&self) {

@@ -41,6 +41,7 @@ pub use splash::{
     compute_scaled_size_120, cover_fill_to_xrgb8888, is_placeholder_pid_alive,
     is_splash_lock_held, process_matches_placeholder, read_proc_start_time, read_splash_header,
     record_placeholder_pid, resolve_startup_placeholders, retire_startup_placeholders,
-    stop_placeholder_pid_file, try_acquire_splash_lock, write_splash_bin_from_packed,
-    SplashInstanceLock, SPLASH_BIN_MAGIC, SPLASH_HEADER_BYTES,
+    stop_placeholder_pid_file, try_acquire_splash_lock, try_load_bgpx_exact_into_memfd,
+    write_pixels_to_memfd, write_splash_bin_from_packed, MemfdBuffer, SplashInstanceLock,
+    SPLASH_BIN_MAGIC, SPLASH_HEADER_BYTES,
 };

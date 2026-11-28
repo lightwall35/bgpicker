@@ -459,3 +459,39 @@ fn looping_non_looping_seek_and_error_recovery() {
         player.shutdown();
     }
 }
+
+#[test]
+fn cuda_first_preference_opens_and_decodes_frames() {
+    let tmp = TempDir::new("cuda-first");
+    let mp4 = tmp.file("clip.mp4");
+    generate_test_mp4(&mp4, "0.6", 30, "orange");
+
+    let mut player = VideoPlayer::new(DecoderConfig {
+        hw_accel: HwAccelPreference::CudaFirst,
+        cpu_format: CpuPixelFormat::Rgba8,
+        pace_frames: false,
+        ..Default::default()
+    })
+    .expect("create player with CudaFirst");
+    let mut fg = player.take_foreground().unwrap();
+    player.open(&mp4);
+
+    assert!(
+        wait_until(Duration::from_secs(10), || player.is_ready()),
+        "expected player with CudaFirst to become ready, status={:?}",
+        player.status()
+    );
+
+    let frame = loop {
+        if let Some(f) = fg.poll() {
+            break f;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(frame.dimensions(), (320, 180));
+    match &frame.data {
+        FrameData::Cpu(cpu) => assert!(!cpu.as_bytes().is_empty()),
+        FrameData::DmaBuf(dma) => assert!(!dma.objects.is_empty()),
+    }
+    player.shutdown();
+}

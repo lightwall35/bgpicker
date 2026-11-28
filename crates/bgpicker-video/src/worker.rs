@@ -829,7 +829,10 @@ fn run_worker(
             }
             Err(VideoError::HardwareFallback(reason))
                 if !state.hw_fallback_used
-                    && state.config.hw_accel == HwAccelPreference::Auto =>
+                    && matches!(
+                        state.config.hw_accel,
+                        HwAccelPreference::Auto | HwAccelPreference::CudaFirst
+                    ) =>
             {
                 state.hw_fallback_used = true;
                 if let Some(path) = state.active_path.clone() {

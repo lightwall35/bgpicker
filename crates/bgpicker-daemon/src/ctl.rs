@@ -728,9 +728,12 @@ pub fn execute(global: CtlGlobalOpts, cmd: CtlCommand) -> Result<Option<String>,
                 retire_startup_placeholders(&paths, &extra_refs);
             }
 
+            let external_placeholder_override =
+                env::var_os("BGPICKER_SPLASH").is_some_and(|s| !s.is_empty())
+                    || env::var_os("BGPICKER_SWAYBG").is_some_and(|s| !s.is_empty());
             let (fg_placeholder, bg_placeholder) =
                 resolve_startup_placeholders(&paths, &project_dir, &persisted);
-            let mut placeholder = if already_live {
+            let mut placeholder = if already_live || !external_placeholder_override {
                 None
             } else {
                 Some(StartupPlaceholderGuard::spawn(
@@ -1339,7 +1342,8 @@ fn ensure_daemon_live(
         .spawn()
         .map_err(|e| format!("failed to spawn {}: {e}", daemon_bin.display()))?;
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Cold-boot NVIDIA EGL + compositor startup can exceed 5s under boot contention.
+    let deadline = Instant::now() + Duration::from_secs(25);
     while Instant::now() < deadline {
         if is_daemon_live(client) {
             return Ok(());

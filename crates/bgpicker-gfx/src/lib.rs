@@ -16,6 +16,7 @@ pub mod frame;
 pub mod layer;
 pub mod math;
 pub mod shaders;
+pub mod splash;
 pub mod wayland;
 
 pub use blur::DualKawaseBlur;
@@ -29,6 +30,7 @@ pub use math::{
     ease_transition_bezier,
 };
 pub use shaders::ShaderPrograms;
+pub use splash::StartupSplashSpec;
 pub use wayland::{
     FrameModeTargets, LayerTargets, OutputSnapshot, RenderCommand, RendererHandle, SurfaceSnapshot,
     WaylandRenderer, compute_scaled_size,

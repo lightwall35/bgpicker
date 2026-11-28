@@ -19,6 +19,7 @@ const BGV_HW_AUTO: c_int = 0;
 const BGV_HW_VAAPI_ONLY: c_int = 1;
 const BGV_HW_CUDA_ONLY: c_int = 2;
 const BGV_HW_SOFTWARE_ONLY: c_int = 3;
+const BGV_HW_CUDA_FIRST: c_int = 4;
 
 const BGV_BACKEND_SOFTWARE: c_int = 0;
 const BGV_BACKEND_VAAPI_DMABUF: c_int = 1;
@@ -216,6 +217,7 @@ impl RawDecoder {
         let opts = BgvOpenOptions {
             hw_mode: match params.hw_accel {
                 HwAccelPreference::Auto => BGV_HW_AUTO,
+                HwAccelPreference::CudaFirst => BGV_HW_CUDA_FIRST,
                 HwAccelPreference::VaapiOnly => BGV_HW_VAAPI_ONLY,
                 HwAccelPreference::CudaOnly => BGV_HW_CUDA_ONLY,
                 HwAccelPreference::SoftwareOnly => BGV_HW_SOFTWARE_ONLY,

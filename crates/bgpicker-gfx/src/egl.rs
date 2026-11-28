@@ -27,6 +27,7 @@ pub struct EglContext {
     surfaceless: bool,
     terminate_on_drop: bool,
     pub is_gles: bool,
+    pub is_nvidia: bool,
     pub bgra_ext_supported: bool,
     pub gl: Arc<glow::Context>,
 }
@@ -152,6 +153,13 @@ impl EglContext {
                 .any(|ext| ext == "GL_EXT_texture_format_BGRA8888" || ext == "GL_EXT_bgra")
         };
 
+        let egl_vendor = egl
+            .query_string(Some(display), egl::VENDOR)
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let gl_vendor = unsafe { gl.get_parameter_string(glow::VENDOR) };
+        let is_nvidia = egl_vendor.to_ascii_lowercase().contains("nvidia")
+            || gl_vendor.to_ascii_lowercase().contains("nvidia");
         let _ver = unsafe { gl.get_parameter_string(glow::VERSION) };
 
         Ok(Self {
@@ -163,6 +171,7 @@ impl EglContext {
             surfaceless,
             terminate_on_drop,
             is_gles,
+            is_nvidia,
             bgra_ext_supported,
             gl,
         })
@@ -212,9 +221,15 @@ impl EglContext {
 
     /// Swaps the back buffer of `surface`.
     pub fn swap_buffers(&self, surface: egl::Surface) -> Result<()> {
-        self.egl
-            .swap_buffers(self.display, surface)
-            .map_err(|e| GfxError::Egl(format!("eglSwapBuffers failed: {e}")))
+        // Guard against `khronos-egl 6.0` panicking in `get_error().unwrap()` when a
+        // compositor disconnects mid-shutdown (`EGL_FALSE` with `EGL_SUCCESS`).
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.egl.swap_buffers(self.display, surface)
+        })) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(GfxError::Egl(format!("eglSwapBuffers failed: {e}"))),
+            Err(_) => Err(GfxError::Egl("eglSwapBuffers failed on disconnected display".into())),
+        }
     }
 
     /// Destroys an `EGLSurface` after detaching it from current if needed.

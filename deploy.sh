@@ -230,9 +230,7 @@ for pat in legacy_patterns:
 
 managed_startup = (
     f"{START_MARK}\n"
-    "//壁纸开机独立垫图守护进程（由 bgpicker-daemon 真实首帧上屏后自动优雅退出）\n"
-    f'spawn-at-startup "{repo}/target/release/bgpicker-splash" "--daemon"\n'
-    "//壁纸守护进程\n"
+    "//壁纸守护进程（内置进程内 wl_shm 开机垫图，首帧 EGL 上屏后自动销毁）\n"
     f'spawn-at-startup "{repo}/target/release/bgpickerctl" "startup"\n'
     f"{END_MARK}\n"
 )

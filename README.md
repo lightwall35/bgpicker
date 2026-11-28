@@ -144,10 +144,9 @@ cargo build --release
 
 编译产物位于 `target/release/bgpicker-daemon`、`target/release/bgpickerctl`、`target/release/bgpicker-picker` 与 `target/release/bgpicker-splash`。通过 `./bgpicker.sh` 等包装脚本调用时，若未找到预编译二进制也会自动触发一次 release 构建；运行 `./bgpicker.sh start` 会仅拉起守护进程（选择器面板保持按需启动）。
 
-在 `~/.config/niri/config.kdl` 顶部加入独立开机垫图与守护进程自启动（`bgpicker-splash` 仅依赖 `libwayland-client` / `libc`，直接映射预渲染 `BGPX` 位图绘制首帧，等 `bgpicker-daemon` 收到 niri 的 `wl_surface.frame` 真正上屏确认后再自动退出，避免交接闪烁且无残留）：
+在 `~/.config/niri/config.kdl` 顶部加入守护进程自启动（`bgpicker-daemon` 会在 EGL/GL 上下文初始化之前，直接在同进程 `wl_shm` 连接上绘制预渲染 `BGPX` 位图或缓存垫图，待 `bgpicker:wallpaper` 真正上屏并收到 niri `wl_surface.frame` 确认后再同一线程内自动销毁临时垫图表面，零跨进程锁竞争与交接闪烁）：
 
 ```kdl
-spawn-at-startup "/你的路径/bgpicker/target/release/bgpicker-splash" "--daemon"
 spawn-at-startup "/你的路径/bgpicker/target/release/bgpickerctl" "startup"
 ```
 
@@ -329,9 +328,9 @@ cp -n settings.example.json "${XDG_CONFIG_HOME:-$HOME/.config}/bgpicker/settings
 ## 目录结构与开发验证
 
 - **`crates/bgpicker-core`**：XDG 路径与原子状态读写、配置规范化与随机效果解析、视差/几何数学、`niri` IPC 客户端、守护进程与选择器 JSON IPC 协议、媒体目录扫描与缩略图/垫图/`BGPX` 位图缓存工具。
-- **`crates/bgpicker-gfx`**：`smithay-client-toolkit` + `wayland-egl` + `glow` 双层渲染器（`bgpicker:wallpaper` / `bgpicker:backdrop`）、换图着色器（`fade`/`wipe`/`wave`/`grow`/`outer`，含跨模式旧画面 `old_mode_blend` 冻结）、图像空间缓存 3-pass `DualKawaseBlur` 与 `WaitPresented` 上屏同步。
-- **`crates/bgpicker-video`**：基于 FFmpeg C FFI（`ffi/ffmpeg_shim.c`）的异步视频解码线程与三缓冲帧池，支持硬件加速探测、帧步调控制、双帧预热与首 4 帧背景预热。
-- **`crates/bgpicker-splash`**：纯 Rust 轻量级开机独立垫图程序（`wl_shm` + `memfd` + `wp_viewporter` + `wp_fractional_scale_v1`，零 EGL/Cairo/gdk-pixbuf/X11 依赖），支持 `--daemon` 单实例自启、`BGPX` 零解码直传与 `--ready-fd` 握手。
+- **`crates/bgpicker-gfx`**：`smithay-client-toolkit` + `wayland-egl` + `glow` 双层渲染器（`bgpicker:wallpaper` / `bgpicker:backdrop`）、`splash` 进程内 pre-EGL `wl_shm` 开机垫图与无闪烁交接、换图着色器（`fade`/`wipe`/`wave`/`grow`/`outer`，含跨模式旧画面 `old_mode_blend` 冻结）、图像空间缓存 3-pass `DualKawaseBlur` 与 `WaitPresented` 上屏同步。
+- **`crates/bgpicker-video`**：基于 FFmpeg C FFI（`ffi/ffmpeg_shim.c`）的异步视频解码线程与三缓冲帧池，支持按当前渲染 GPU 自动匹配硬解优先级（NVIDIA EGL 优先 `CUDA`/`NVDEC` -> `VA-API`，核显/Mesa 优先 `VA-API` -> `CUDA`）、帧步调控制、双帧预热与首 4 帧背景预热。
+- **`crates/bgpicker-splash`**：兼容独立轻量 `wl_shm` 垫图 CLI（共享 `bgpicker-core` 的 `memfd`/`BGPX` 缓冲逻辑），支持 `--daemon` / `--ready-fd` 及 `BGPICKER_SPLASH` 覆盖测试。
 - **`crates/bgpicker-daemon`**：单线程序列化 Actor 状态机、`bgpicker-daemon` 守护进程与 `bgpickerctl` CLI、`inotify` 配置监听与按需选择器拉起。
 - **`crates/bgpicker-picker`**：纯 Rust 原生 Wayland 覆盖层面板（`bgpicker:overlay`）：`state.rs` 状态机与弹簧/三次缓动动画、`render.rs` 单通道 SDF 圆角倾斜卡片与控件着色器、`text.rs` 惰性零拷贝 `swash` + `mmap` HiDPI 中英文字形图集、`thumbs.rs` 有界异步 LRU 缩略图与 1.5s 原图放大缓存、`wayland.rs`/`ipc.rs` 单实例事件循环与守护进程桥接。
 - **部署与兼容脚本**：`deploy.sh` 与 `uninstall.sh` 负责新机器从零部署与彻底清除；`shell.qml`、`BgPicker.qml`、`Carousel.qml`、`CarouselMedia.js`、`SkewSelector.qml`、`WallpaperTransitions.js` 保留作为 `BGPICKER_USE_QS=1` 回退前端；`bgpicker.sh`、`bgpicker_stats.sh`、`wallpaper_engine.sh`、`switch_wallpaper.sh`、`picker_action.sh`、`backdrop_parallax.sh`、`backdrop_awww.sh`、`simple_wallpaper.sh` 代理到 `bgpickerctl` 或管理简洁模式。

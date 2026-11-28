@@ -3228,3 +3228,154 @@ if os.path.exists(sock_path):
     );
     assert!(run_ctl(&["stop"]).status.success());
 }
+
+#[test]
+fn ctl_startup_without_override_uses_in_daemon_splash_and_skips_legacy_video_bg() {
+    use bgpicker_core::{resolve_startup_placeholders, EngineKind, PersistedState};
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("in-daemon-splash-default");
+    let root = tmp.path();
+    let paths = isolated_paths(root);
+    let proj = root.join("proj");
+    fs::create_dir_all(proj.join("wallpapers")).unwrap();
+    fs::create_dir_all(proj.join("dynamic")).unwrap();
+
+    let img_wp = proj.join("wallpapers/wp.png");
+    let blur_wp = root.join("cache/bgpicker/blur/legacy_static_blur.png");
+    let fake_vid = proj.join("dynamic/sample.mp4");
+    fs::create_dir_all(blur_wp.parent().unwrap()).unwrap();
+    write_tiny_png(&img_wp);
+    write_tiny_png(&blur_wp);
+    fs::write(&fake_vid, b"not-a-real-mp4").unwrap();
+
+    atomic_write_text(&paths.engine_file(), "video").unwrap();
+    atomic_write_text(&paths.mode_file(), "parallax").unwrap();
+    atomic_write_text(&paths.current_wallpaper_file(), img_wp.to_str().unwrap()).unwrap();
+    atomic_write_text(&paths.video_wallpaper_file(), fake_vid.to_str().unwrap()).unwrap();
+    atomic_write_text(&paths.legacy_swaybg_cache_file(), blur_wp.to_str().unwrap()).unwrap();
+
+    // 1. Video mode must NOT fall back to legacy swaybg static blur cache (`blur_wp`).
+    let persisted = PersistedState::load(&paths);
+    assert_eq!(persisted.engine, EngineKind::Video);
+    let (fg_v, bg_v) = resolve_startup_placeholders(&paths, &proj, &persisted);
+    assert_ne!(
+        bg_v.as_deref(),
+        Some(blur_wp.as_path()),
+        "expected no legacy static swaybg backdrop placeholder for Video engine, got {bg_v:?}"
+    );
+    assert_eq!(bg_v, fg_v);
+
+    // 2. Default `ctl startup` (without BGPICKER_SPLASH / BGPICKER_SWAYBG) must NOT spawn external
+    // `bgpicker-splash` or `swaybg` even if present in PATH.
+    atomic_write_text(&paths.engine_file(), "full").unwrap();
+    let events_log = root.join("events.log");
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    for trap in ["bgpicker-splash", "swaybg"] {
+        let p = bin_dir.join(trap);
+        fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\necho EXT_SPAWN_{trap} >> \"{}\"\nexit 1\n",
+                events_log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let fake_daemon = root.join("fake_daemon.py");
+    fs::write(
+        &fake_daemon,
+        r#"#!/usr/bin/env python3
+import json, os, socket, sys
+
+log_path = os.environ["TEST_EVENTS_LOG"]
+def log(msg):
+    with open(log_path, "a") as f:
+        f.write(msg + "\n")
+
+args = sys.argv[1:]
+sock_path = args[args.index("--socket") + 1]
+os.makedirs(os.path.dirname(sock_path), exist_ok=True)
+if os.path.exists(sock_path):
+    os.unlink(sock_path)
+
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sock_path)
+srv.listen(8)
+
+running = True
+while running:
+    conn, _ = srv.accept()
+    with conn:
+        f = conn.makefile("rwb")
+        while True:
+            line = f.readline()
+            if not line:
+                break
+            req = json.loads(line.decode())
+            cmd = req.get("cmd")
+            if cmd == "ping":
+                resp = {"ok": True, "data": {"kind": "pong"}}
+            elif cmd == "startup_seed":
+                log("DAEMON_STARTUP_SEED")
+                resp = {"ok": True, "data": {"kind": "message", "value": "seeded"}}
+            elif cmd == "startup_settle":
+                log("DAEMON_STARTUP_SETTLE")
+                resp = {"ok": True}
+            elif cmd == "stop":
+                resp = {"ok": True}
+                running = False
+            else:
+                resp = {"ok": True}
+            f.write((json.dumps(resp) + "\n").encode())
+            f.flush()
+            if not running:
+                break
+srv.close()
+if os.path.exists(sock_path):
+    os.unlink(sock_path)
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&fake_daemon, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let orig_path = std::env::var("PATH").unwrap_or_default();
+    let test_path = format!("{}:{orig_path}", bin_dir.display());
+    let ctl_bin = env!("CARGO_BIN_EXE_bgpickerctl");
+    let sock = paths.daemon_socket_path();
+    let run_ctl = |args: &[&str]| {
+        Command::new(ctl_bin)
+            .args(["--socket", sock.to_str().unwrap(), "--project-dir", proj.to_str().unwrap()])
+            .args(args)
+            .env("HOME", root.join("home"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_RUNTIME_DIR", root.join("runtime"))
+            .env("PATH", &test_path)
+            .env("BGPICKER_DAEMON", &fake_daemon)
+            .env("TEST_EVENTS_LOG", &events_log)
+            .env_remove("BGPICKER_SPLASH")
+            .env_remove("BGPICKER_SWAYBG")
+            .env_remove("NIRI_SOCKET")
+            .output()
+            .expect("run bgpickerctl")
+    };
+
+    let out = run_ctl(&["startup"]);
+    assert!(
+        out.status.success(),
+        "startup failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let events = fs::read_to_string(&events_log).unwrap();
+    assert!(
+        !events.contains("EXT_SPAWN_"),
+        "expected default startup not to spawn external placeholder binaries:\n{events}"
+    );
+    assert!(events.contains("DAEMON_STARTUP_SEED") && events.contains("DAEMON_STARTUP_SETTLE"));
+    assert!(run_ctl(&["stop"]).status.success());
+}
